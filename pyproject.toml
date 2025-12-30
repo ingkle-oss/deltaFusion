@@ -18,14 +18,24 @@ classifiers = [
     "Topic :: Database",
     "Topic :: Scientific/Engineering",
 ]
-dependencies = [
-    "pyarrow>=14.0.0",
-]
+dependencies = []
 
 [project.optional-dependencies]
+pyarrow = [
+    "pyarrow>=14.0.0",
+]
+polars = [
+    "polars>=0.20.0",
+]
+all = [
+    "pyarrow>=14.0.0",
+    "polars>=0.20.0",
+]
 dev = [
     "pytest>=7.0",
     "pandas>=2.0",
+    "pyarrow>=14.0.0",
+    "polars>=0.20.0",
     "maturin>=1.7",
 ]
 

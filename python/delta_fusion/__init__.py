@@ -178,6 +178,34 @@ class DeltaEngine:
         """
         return self._engine.read_time_range(name, start, end)
 
+    def read_time_range_polars(self, name: str, start: str, end: str) -> "pl.DataFrame":
+        """Read time range data and return Polars DataFrame.
+
+        This BYPASSES Delta log entirely for maximum performance.
+        Requires: pip install delta_fusion[polars]
+
+        Args:
+            name: Registered time series name
+            start: Start timestamp (ISO 8601, e.g., "2024-01-01T10:30:00")
+            end: End timestamp (ISO 8601, e.g., "2024-01-01T14:00:00")
+
+        Returns:
+            polars.DataFrame
+        """
+        import io
+        try:
+            import polars as pl
+        except ImportError:
+            raise ImportError(
+                "polars is required for read_time_range_polars(). "
+                "Install with: pip install delta_fusion[polars]"
+            )
+
+        ipc_bytes = self._engine.read_time_range_ipc(name, start, end)
+        if not ipc_bytes:
+            return pl.DataFrame()
+        return pl.read_ipc(io.BytesIO(ipc_bytes))
+
     def read_time_range_direct(
         self,
         path: str,
@@ -216,6 +244,7 @@ class DeltaEngine:
         """Execute SQL query and return PyArrow RecordBatches.
 
         This is the primary query method, returning zero-copy Arrow data.
+        Requires: pip install delta_fusion[pyarrow]
 
         Args:
             sql: SQL query string
@@ -225,10 +254,37 @@ class DeltaEngine:
         """
         return self._engine.query(sql)
 
+    def query_polars(self, sql: str) -> "pl.DataFrame":
+        """Execute SQL query and return Polars DataFrame.
+
+        Requires: pip install delta_fusion[polars]
+
+        Args:
+            sql: SQL query string
+
+        Returns:
+            polars.DataFrame
+        """
+        import io
+        try:
+            import polars as pl
+        except ImportError:
+            raise ImportError(
+                "polars is required for query_polars(). "
+                "Install with: pip install delta_fusion[polars]"
+            )
+
+        ipc_bytes = self._engine.query_ipc(sql)
+        if not ipc_bytes:
+            # Return empty DataFrame
+            return pl.DataFrame()
+        return pl.read_ipc(io.BytesIO(ipc_bytes))
+
     def query_to_dicts(self, sql: str) -> list[dict]:
         """Execute SQL query and return as list of dictionaries.
 
-        WARNING: Slow for large datasets. Prefer query() with PyArrow.
+        No external dependencies required.
+        WARNING: Slow for large datasets. Prefer query_polars() or query().
         """
         return self._engine.query_to_dicts(sql)
 

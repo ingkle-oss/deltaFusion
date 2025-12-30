@@ -16,7 +16,8 @@ python = ["pyo3"]
 deltalake = { version = "0.22", features = ["datafusion"] }
 
 # Arrow & DataFusion
-arrow = { version = "53", features = ["pyarrow"] }
+arrow = { version = "53", features = ["pyarrow", "ipc"] }
+arrow-ipc = "53"
 datafusion = "43"
 
 # PyO3 bindings

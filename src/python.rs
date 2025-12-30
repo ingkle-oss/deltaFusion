@@ -8,7 +8,7 @@
 //! - Time series API bypasses Delta log for fast partition-based access
 
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::{PyBytes, PyDict, PyList};
 use pyo3::ToPyObject;
 
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
@@ -115,6 +115,31 @@ fn pyarrow_to_batches(py: Python<'_>, data: &PyObject) -> PyResult<Vec<RecordBat
 /// Convert RecordBatches to PyArrow objects.
 fn batches_to_pyarrow(py: Python<'_>, batches: Vec<RecordBatch>) -> PyResult<Vec<PyObject>> {
     batches.into_iter().map(|batch| batch.to_pyarrow(py)).collect()
+}
+
+/// Convert RecordBatches to Arrow IPC bytes (as Python bytes object).
+/// Uses IPC File format (with footer) for compatibility with Polars.
+fn batches_to_ipc_bytes(py: Python<'_>, batches: Vec<RecordBatch>) -> PyResult<Py<PyBytes>> {
+    use arrow_ipc::writer::FileWriter;
+
+    if batches.is_empty() {
+        return Ok(PyBytes::new_bound(py, &[]).unbind());
+    }
+
+    let schema = batches[0].schema();
+    let mut buffer: Vec<u8> = Vec::new();
+    let mut writer = FileWriter::try_new(&mut buffer, &schema)
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("IPC writer error: {}", e)))?;
+
+    for batch in batches {
+        writer.write(&batch)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("IPC write error: {}", e)))?;
+    }
+
+    writer.finish()
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("IPC finish error: {}", e)))?;
+
+    Ok(PyBytes::new_bound(py, &buffer).unbind())
 }
 
 /// Parse write mode string to WriteMode enum.
@@ -320,6 +345,20 @@ impl PyDeltaEngine {
         batches_to_pyarrow(py, batches)
     }
 
+    /// Read time range data and return as Arrow IPC bytes.
+    fn read_time_range_ipc(
+        &self,
+        py: Python<'_>,
+        name: String,
+        start: String,
+        end: String,
+    ) -> PyResult<Py<PyBytes>> {
+        let batches = self.executor.run_readonly(py, |engine| {
+            Box::pin(async move { engine.read_time_range(&name, &start, &end).await })
+        })?;
+        batches_to_ipc_bytes(py, batches)
+    }
+
     /// Deregister a time series.
     fn deregister_time_series(&self, py: Python<'_>, name: String) -> PyResult<()> {
         self.executor.run_sync(py, |engine| {
@@ -347,6 +386,18 @@ impl PyDeltaEngine {
         })?;
 
         batches_to_dict_list(py, &batches)
+    }
+
+    /// Execute a SQL query and return results as Arrow IPC bytes.
+    ///
+    /// This method is useful for Polars integration without PyArrow dependency.
+    /// Use `polars.read_ipc(bytes)` to convert to a Polars DataFrame.
+    fn query_ipc(&self, py: Python<'_>, sql: String) -> PyResult<Py<PyBytes>> {
+        let batches: Vec<RecordBatch> = self.executor.run_readonly(py, |engine| {
+            Box::pin(async move { engine.query(&sql).await })
+        })?;
+
+        batches_to_ipc_bytes(py, batches)
     }
 
     // ========================================================================
