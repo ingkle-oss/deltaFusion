@@ -367,9 +367,113 @@ def test_query_to_dicts():
         print("\n  ✅ Query to dicts test passed!")
 
 
+def test_hierarchical_time_series():
+    """Test hierarchical time series (year/month/day partitions)."""
+    print_section("6. Hierarchical Time Series (year/month/day)")
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        base_path = Path(tmp_dir) / "hierarchical_data"
+        engine = DeltaEngine()
+
+        # Create year/month/day partitioned parquet files
+        print("Creating hierarchical partitioned data...")
+
+        import pyarrow.parquet as pq
+
+        # Create data for 2 days across 2 different months
+        dates = [
+            ("2024", "01", "30"),
+            ("2024", "01", "31"),
+            ("2024", "02", "01"),
+        ]
+
+        for year, month, day in dates:
+            partition_dir = base_path / f"year={year}" / f"month={month}" / f"day={day}"
+            partition_dir.mkdir(parents=True, exist_ok=True)
+
+            # Create sample data for each day
+            full_date = f"{year}-{month}-{day}"
+            table = pa.table({
+                "ts": [
+                    f"{full_date}T10:00:00",
+                    f"{full_date}T12:00:00",
+                    f"{full_date}T14:00:00",
+                ],
+                "sensor_id": ["S1", "S2", "S1"],
+                "value": [23.5, 24.0, 24.5],
+            })
+
+            # Write as parquet
+            pq.write_table(table, partition_dir / "data.parquet")
+
+        print(f"  ✓ Created 3 days of data with year/month/day partitions")
+
+        # Test hierarchical time series registration
+        print("\nTesting hierarchical time series registration...")
+        engine.register_time_series_hierarchical(
+            name="hierarchical_sensor",
+            path=str(base_path),
+            timestamp_col="ts",
+            partition_cols=["year", "month", "day"],
+            partition_formats=["%Y", "%m", "%d"],
+        )
+        print("  ✓ Hierarchical time series registered")
+
+        assert engine.is_time_series_registered("hierarchical_sensor")
+        print("  ✓ is_time_series_registered() works")
+
+        # Read single day
+        print("\nReading single day (2024-01-31)...")
+        batches = engine.read_time_range(
+            "hierarchical_sensor",
+            "2024-01-31T00:00:00",
+            "2024-02-01T00:00:00"
+        )
+        if batches:
+            result = pa.Table.from_batches(batches)
+            print(f"  ✓ Single day (2024-01-31): {len(result)} rows")
+            assert len(result) == 3, f"Expected 3 rows, got {len(result)}"
+        else:
+            print("  ✗ No data returned")
+            assert False, "Expected data from read_time_range"
+
+        # Read across month boundary (Jan 30 - Feb 1)
+        print("\nReading cross-month range (2024-01-30 to 2024-02-02)...")
+        batches = engine.read_time_range(
+            "hierarchical_sensor",
+            "2024-01-30T00:00:00",
+            "2024-02-02T00:00:00"
+        )
+        if batches:
+            result = pa.Table.from_batches(batches)
+            print(f"  ✓ Cross-month range: {len(result)} rows")
+            assert len(result) == 9, f"Expected 9 rows (3 days * 3 rows), got {len(result)}"
+        else:
+            print("  ✗ No data returned")
+            assert False, "Expected data from read_time_range"
+
+        # Test timestamp filtering within partition
+        print("\nTesting timestamp filtering...")
+        batches = engine.read_time_range(
+            "hierarchical_sensor",
+            "2024-01-30T11:00:00",
+            "2024-01-30T15:00:00"
+        )
+        if batches:
+            result = pa.Table.from_batches(batches)
+            print(f"  ✓ Filtered (11:00-15:00 on Jan 30): {len(result)} rows")
+            # Should get rows at 12:00 and 14:00
+            assert len(result) == 2, f"Expected 2 rows, got {len(result)}"
+        else:
+            print("  ✗ No data returned")
+            assert False, "Expected filtered data"
+
+        print("\n  ✅ Hierarchical time series test passed!")
+
+
 def test_metadata():
     """Test metadata methods."""
-    print_section("6. Metadata")
+    print_section("7. Metadata")
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         table_path = Path(tmp_dir) / "meta_test"
@@ -413,6 +517,7 @@ def main():
         test_time_series()
         test_data_types()
         test_query_to_dicts()
+        test_hierarchical_time_series()
         test_metadata()
 
         print("\n" + "="*60)

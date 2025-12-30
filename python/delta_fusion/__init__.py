@@ -118,6 +118,40 @@ class DeltaEngine:
             name, path, timestamp_col, partition_col, partition_format
         )
 
+    def register_time_series_hierarchical(
+        self,
+        name: str,
+        path: str,
+        timestamp_col: str,
+        partition_cols: list[str],
+        partition_formats: list[str],
+    ) -> None:
+        """Register a time series with hierarchical partitions.
+
+        Use this for data partitioned like: `year=2024/month=01/day=15`
+
+        NOTE: This does NOT read any data or Delta log. It's instant.
+
+        Args:
+            name: Name for the time series
+            path: Base path to the data (e.g., "s3://bucket/sensor_data")
+            timestamp_col: Timestamp column name in parquet files
+            partition_cols: List of partition column names (e.g., ["year", "month", "day"])
+            partition_formats: List of format strings (e.g., ["%Y", "%m", "%d"])
+
+        Example:
+            >>> engine.register_time_series_hierarchical(
+            ...     "sensor",
+            ...     "s3://bucket/sensor_data",
+            ...     timestamp_col="timestamp",
+            ...     partition_cols=["year", "month", "day"],
+            ...     partition_formats=["%Y", "%m", "%d"],
+            ... )
+        """
+        self._engine.register_time_series_hierarchical(
+            name, path, timestamp_col, partition_cols, partition_formats
+        )
+
     def read_time_range(self, name: str, start: str, end: str) -> list:
         """Read time range data directly from parquet files.
 

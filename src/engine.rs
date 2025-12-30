@@ -195,6 +195,33 @@ impl DeltaEngine {
         self.time_series.insert(name.to_string(), config);
     }
 
+    /// Register a time series with hierarchical partitions (e.g., year/month/day).
+    ///
+    /// This enables reading data partitioned like: `year=2024/month=01/day=15`
+    ///
+    /// # Arguments
+    /// * `name` - Name for the time series
+    /// * `path` - Base path to the data
+    /// * `timestamp_col` - Timestamp column name in parquet files
+    /// * `partition_cols` - Partition column names (e.g., ["year", "month", "day"])
+    /// * `partition_formats` - Format strings for each partition column (e.g., ["%Y", "%m", "%d"])
+    pub fn register_time_series_hierarchical(
+        &mut self,
+        name: &str,
+        path: &str,
+        timestamp_col: &str,
+        partition_cols: &[&str],
+        partition_formats: &[&str],
+    ) {
+        let config = TimeSeriesConfig::with_partitions(
+            path,
+            partition_cols.to_vec(),
+            partition_formats.to_vec(),
+            timestamp_col,
+        );
+        self.time_series.insert(name.to_string(), config);
+    }
+
     /// Read time range data directly from parquet files.
     ///
     /// This bypasses Delta log entirely for maximum performance.

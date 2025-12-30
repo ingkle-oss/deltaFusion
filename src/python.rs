@@ -246,6 +246,44 @@ impl PyDeltaEngine {
         })
     }
 
+    /// Register a time series with hierarchical partitions (e.g., year/month/day).
+    ///
+    /// This method supports multiple partition columns for hierarchical date partitioning.
+    ///
+    /// Args:
+    ///     name: Name for the time series
+    ///     path: Base path to the data
+    ///     timestamp_col: Timestamp column name in parquet files
+    ///     partition_cols: List of partition column names (e.g., ["year", "month", "day"])
+    ///     partition_formats: List of format strings (e.g., ["%Y", "%m", "%d"])
+    #[pyo3(signature = (name, path, timestamp_col, partition_cols, partition_formats))]
+    fn register_time_series_hierarchical(
+        &self,
+        py: Python<'_>,
+        name: String,
+        path: String,
+        timestamp_col: String,
+        partition_cols: Vec<String>,
+        partition_formats: Vec<String>,
+    ) -> PyResult<()> {
+        if partition_cols.len() != partition_formats.len() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "partition_cols and partition_formats must have the same length",
+            ));
+        }
+
+        self.executor.run_sync(py, |engine| {
+            engine.register_time_series_hierarchical(
+                &name,
+                &path,
+                &timestamp_col,
+                &partition_cols.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                &partition_formats.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            );
+            Ok(())
+        })
+    }
+
     /// Read time range data directly from parquet files.
     fn read_time_range(
         &self,
