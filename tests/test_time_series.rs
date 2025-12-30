@@ -3,7 +3,7 @@
 mod common;
 
 use delta_fusion::time_series::{
-    generate_partition_glob, generate_partition_paths, parse_timestamp, TimeSeriesConfig,
+    generate_partition_glob, generate_partition_paths, parse_timestamp, TimeSeriesConfig, Timestamp,
 };
 use delta_fusion::DeltaEngine;
 use tempfile::TempDir;
@@ -45,26 +45,68 @@ fn test_parse_timestamp_invalid() {
     assert!(result.is_err());
 }
 
+// =============================================================================
+// Timestamp struct tests
+// =============================================================================
+
+#[test]
+fn test_timestamp_parse_utc() {
+    let ts = Timestamp::parse("2024-01-15T10:30:00Z").unwrap();
+    assert_eq!(ts.date().to_string(), "2024-01-15");
+}
+
+#[test]
+fn test_timestamp_parse_with_timezone() {
+    let ts = Timestamp::parse("2024-01-15T10:30:00+09:00").unwrap();
+    // Should convert to UTC internally
+    assert_eq!(ts.date().to_string(), "2024-01-15");
+}
+
+#[test]
+fn test_timestamp_parse_with_millis_utc() {
+    let ts = Timestamp::parse("2024-01-15T10:30:00.123Z").unwrap();
+    assert_eq!(ts.date().to_string(), "2024-01-15");
+}
+
+#[test]
+fn test_timestamp_to_iso8601() {
+    let ts = Timestamp::parse("2024-01-15T10:30:00").unwrap();
+    assert_eq!(ts.to_iso8601(), "2024-01-15T10:30:00");
+}
+
+#[test]
+fn test_timestamp_display() {
+    let ts = Timestamp::parse("2024-01-15T10:30:45").unwrap();
+    assert_eq!(format!("{}", ts), "2024-01-15T10:30:45");
+}
+
+#[test]
+fn test_timestamp_as_naive() {
+    let ts = Timestamp::parse("2024-01-15T10:30:00").unwrap();
+    let naive = ts.as_naive();
+    assert_eq!(naive.to_string(), "2024-01-15 10:30:00");
+}
+
 #[test]
 fn test_time_series_config_new() {
     let config = TimeSeriesConfig::new("s3://bucket/data", "dt", "timestamp");
-    assert_eq!(config.path, "s3://bucket/data");
-    assert_eq!(config.partition_col, "dt");
-    assert_eq!(config.timestamp_col, "timestamp");
-    assert_eq!(config.partition_format, "%Y-%m-%d");
+    assert_eq!(config.path(), "s3://bucket/data");
+    assert_eq!(config.partition_col(), "dt");
+    assert_eq!(config.timestamp_col(), "timestamp");
+    assert_eq!(config.partition_format(), "%Y-%m-%d");
 }
 
 #[test]
 fn test_time_series_config_trailing_slash() {
     let config = TimeSeriesConfig::new("s3://bucket/data/", "dt", "timestamp");
-    assert_eq!(config.path, "s3://bucket/data");
+    assert_eq!(config.path(), "s3://bucket/data");
 }
 
 #[test]
 fn test_time_series_config_custom_format() {
     let config = TimeSeriesConfig::new("s3://bucket/data", "dt", "timestamp")
         .with_partition_format("%Y%m%d");
-    assert_eq!(config.partition_format, "%Y%m%d");
+    assert_eq!(config.partition_format(), "%Y%m%d");
 }
 
 #[test]

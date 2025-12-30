@@ -19,7 +19,7 @@ Example:
     >>> batches = engine.read_time_range("sensor", "2024-01-01T00:00:00", "2024-01-01T12:00:00")
 """
 
-from delta_fusion._core import PyDeltaEngine
+from delta_fusion._core import DeltaEngine as _CoreEngine
 
 __all__ = ["DeltaEngine"]
 
@@ -48,7 +48,7 @@ class DeltaEngine:
     """
 
     def __init__(self, storage_options: dict | None = None):
-        self._engine = PyDeltaEngine(storage_options)
+        self._engine = _CoreEngine(storage_options)
 
     # ========================================================================
     # Delta Table Methods
@@ -115,7 +115,7 @@ class DeltaEngine:
             ... )
         """
         self._engine.register_time_series(
-            name, path, partition_col, timestamp_col, partition_format
+            name, path, timestamp_col, partition_col, partition_format
         )
 
     def read_time_range(self, name: str, start: str, end: str) -> list:
@@ -167,7 +167,7 @@ class DeltaEngine:
             List of pyarrow.RecordBatch objects
         """
         return self._engine.read_time_range_direct(
-            path, partition_col, timestamp_col, start, end
+            path, timestamp_col, start, end, partition_col
         )
 
     def deregister_time_series(self, name: str) -> None:

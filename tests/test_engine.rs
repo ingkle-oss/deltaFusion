@@ -18,13 +18,11 @@ fn test_engine_new() {
 
 #[test]
 fn test_engine_with_config() {
-    let config = StorageConfig {
-        aws_access_key_id: Some("test_key".to_string()),
-        aws_secret_access_key: Some("test_secret".to_string()),
-        aws_region: Some("us-east-1".to_string()),
-        aws_endpoint: None,
-        aws_allow_http: false,
-    };
+    let config = StorageConfig::builder()
+        .aws_access_key_id("test_key")
+        .aws_secret_access_key("test_secret")
+        .aws_region("us-east-1")
+        .build();
 
     let engine = DeltaEngine::with_config(config);
     assert!(engine.list_tables().is_empty());
@@ -41,7 +39,38 @@ fn test_storage_config_from_env() {
     // This should not panic even without env vars
     let config = StorageConfig::from_env();
     // Default values
-    assert!(!config.aws_allow_http);
+    assert!(!config.aws_allow_http());
+}
+
+#[test]
+fn test_storage_config_builder() {
+    let config = StorageConfig::builder()
+        .aws_access_key_id("key")
+        .aws_secret_access_key("secret")
+        .aws_region("us-west-2")
+        .aws_endpoint("http://localhost:9000")
+        .aws_allow_http(true)
+        .build();
+
+    assert_eq!(config.aws_access_key_id(), Some("key"));
+    assert_eq!(config.aws_secret_access_key(), Some("secret"));
+    assert_eq!(config.aws_region(), Some("us-west-2"));
+    assert_eq!(config.aws_endpoint(), Some("http://localhost:9000"));
+    assert!(config.aws_allow_http());
+    assert!(config.has_s3_credentials());
+}
+
+#[test]
+fn test_storage_config_to_options() {
+    let config = StorageConfig::builder()
+        .aws_access_key_id("key")
+        .aws_region("us-east-1")
+        .build();
+
+    let opts = config.to_storage_options();
+    assert_eq!(opts.get("AWS_ACCESS_KEY_ID"), Some(&"key".to_string()));
+    assert_eq!(opts.get("AWS_REGION"), Some(&"us-east-1".to_string()));
+    assert!(opts.get("AWS_SECRET_ACCESS_KEY").is_none());
 }
 
 // =============================================================================

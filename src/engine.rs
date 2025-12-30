@@ -253,7 +253,7 @@ impl DeltaEngine {
             // Combined table registered successfully
             let sql = format!(
                 "SELECT * FROM _ts_temp WHERE {} >= '{}' AND {} < '{}'",
-                config.timestamp_col, start, config.timestamp_col, end
+                config.timestamp_col(), start, config.timestamp_col(), end
             );
             let df = ctx.sql(&sql).await?;
             df.collect().await?
@@ -267,7 +267,7 @@ impl DeltaEngine {
                 }
                 union_sql.push_str(&format!(
                     "SELECT * FROM _ts_part_{} WHERE {} >= '{}' AND {} < '{}'",
-                    i, config.timestamp_col, start, config.timestamp_col, end
+                    i, config.timestamp_col(), start, config.timestamp_col(), end
                 ));
             }
             match ctx.sql(&union_sql).await {
@@ -716,29 +716,4 @@ pub struct TableInfo {
     pub schema: String,
     pub num_files: usize,
     pub partition_columns: Vec<String>,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_engine_creation() {
-        let engine = DeltaEngine::new();
-        assert!(engine.list_tables().is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_is_registered() {
-        let engine = DeltaEngine::new();
-        assert!(!engine.is_registered("nonexistent"));
-    }
-
-    #[test]
-    fn test_register_time_series() {
-        let mut engine = DeltaEngine::new();
-        engine.register_time_series("sensor", "s3://bucket/data", "dt", "timestamp");
-        assert!(engine.is_time_series_registered("sensor"));
-        assert!(!engine.is_time_series_registered("other"));
-    }
 }

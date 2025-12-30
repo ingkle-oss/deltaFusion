@@ -11,20 +11,141 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use pyo3::ToPyObject;
 
-use arrow::pyarrow::ToPyArrow;
+use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use arrow::record_batch::RecordBatch;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 
 use crate::config::{init_logging, StorageConfig};
-use crate::engine::DeltaEngine;
+use crate::engine::{DeltaEngine, WriteMode};
 use crate::error::DeltaFusionError;
 
-/// Python wrapper for DeltaEngine.
-#[pyclass]
-pub struct PyDeltaEngine {
+// =============================================================================
+// Helper Types and Functions
+// =============================================================================
+
+/// Async executor that handles GIL release and runtime management.
+struct AsyncExecutor {
     engine: Arc<tokio::sync::Mutex<DeltaEngine>>,
     runtime: Arc<Runtime>,
+}
+
+impl AsyncExecutor {
+    fn new(engine: Arc<tokio::sync::Mutex<DeltaEngine>>, runtime: Arc<Runtime>) -> Self {
+        Self { engine, runtime }
+    }
+
+    /// Execute an async operation with GIL release.
+    fn run<F, T>(&self, py: Python<'_>, f: F) -> PyResult<T>
+    where
+        F: FnOnce(&mut DeltaEngine) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::error::Result<T>> + Send + '_>> + Send,
+        T: Send,
+    {
+        let engine = Arc::clone(&self.engine);
+        let runtime = Arc::clone(&self.runtime);
+
+        py.allow_threads(|| {
+            runtime.block_on(async {
+                let mut engine = engine.lock().await;
+                f(&mut engine).await
+            })
+        }).map_err(Into::into)
+    }
+
+    /// Execute an async operation that doesn't need mutable access.
+    fn run_readonly<F, T>(&self, py: Python<'_>, f: F) -> PyResult<T>
+    where
+        F: FnOnce(&DeltaEngine) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::error::Result<T>> + Send + '_>> + Send,
+        T: Send,
+    {
+        let engine = Arc::clone(&self.engine);
+        let runtime = Arc::clone(&self.runtime);
+
+        py.allow_threads(|| {
+            runtime.block_on(async {
+                let engine = engine.lock().await;
+                f(&engine).await
+            })
+        }).map_err(Into::into)
+    }
+
+    /// Execute a sync operation with GIL release.
+    fn run_sync<F, T>(&self, py: Python<'_>, f: F) -> PyResult<T>
+    where
+        F: FnOnce(&mut DeltaEngine) -> crate::error::Result<T> + Send,
+        T: Send,
+    {
+        let engine = Arc::clone(&self.engine);
+        let runtime = Arc::clone(&self.runtime);
+
+        py.allow_threads(|| {
+            runtime.block_on(async {
+                let mut engine = engine.lock().await;
+                f(&mut engine)
+            })
+        }).map_err(Into::into)
+    }
+}
+
+/// Convert PyArrow data (Table or RecordBatches) to Vec<RecordBatch>.
+fn pyarrow_to_batches(py: Python<'_>, data: &PyObject) -> PyResult<Vec<RecordBatch>> {
+    let data_bound = data.bind(py);
+
+    if data_bound.hasattr("to_batches")? {
+        // It's a PyArrow Table - convert to batches
+        let batch_list = data_bound.call_method0("to_batches")?;
+        let batch_vec = batch_list.extract::<Vec<PyObject>>()?;
+        batch_vec
+            .into_iter()
+            .map(|obj| RecordBatch::from_pyarrow_bound(obj.bind(py)))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    } else if let Ok(list) = data.extract::<Vec<PyObject>>(py) {
+        // It's a list of RecordBatches
+        list.into_iter()
+            .map(|obj| RecordBatch::from_pyarrow_bound(obj.bind(py)))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    } else {
+        // Try as a single RecordBatch
+        Ok(vec![RecordBatch::from_pyarrow_bound(data_bound)?])
+    }
+}
+
+/// Convert RecordBatches to PyArrow objects.
+fn batches_to_pyarrow(py: Python<'_>, batches: Vec<RecordBatch>) -> PyResult<Vec<PyObject>> {
+    batches.into_iter().map(|batch| batch.to_pyarrow(py)).collect()
+}
+
+/// Parse write mode string to WriteMode enum.
+fn parse_write_mode(mode: &str, allow_error_ignore: bool) -> PyResult<WriteMode> {
+    match mode {
+        "append" => Ok(WriteMode::Append),
+        "overwrite" => Ok(WriteMode::Overwrite),
+        "error" if allow_error_ignore => Ok(WriteMode::ErrorIfExists),
+        "ignore" if allow_error_ignore => Ok(WriteMode::Ignore),
+        _ => {
+            let valid_modes = if allow_error_ignore {
+                "'append', 'overwrite', 'error', or 'ignore'"
+            } else {
+                "'append' or 'overwrite'"
+            };
+            Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "Invalid mode: {}. Use {}",
+                mode, valid_modes
+            )))
+        }
+    }
+}
+
+// =============================================================================
+// Python Engine Wrapper
+// =============================================================================
+
+/// Python wrapper for DeltaEngine.
+#[pyclass(name = "DeltaEngine")]
+pub struct PyDeltaEngine {
+    executor: AsyncExecutor,
 }
 
 #[pymethods]
@@ -35,27 +156,7 @@ impl PyDeltaEngine {
     fn new(storage_options: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
         init_logging();
 
-        let storage_config = if let Some(opts) = storage_options {
-            let mut config = StorageConfig::default();
-            if let Some(val) = opts.get_item("aws_access_key_id")? {
-                config.aws_access_key_id = Some(val.extract()?);
-            }
-            if let Some(val) = opts.get_item("aws_secret_access_key")? {
-                config.aws_secret_access_key = Some(val.extract()?);
-            }
-            if let Some(val) = opts.get_item("aws_region")? {
-                config.aws_region = Some(val.extract()?);
-            }
-            if let Some(val) = opts.get_item("aws_endpoint")? {
-                config.aws_endpoint = Some(val.extract()?);
-            }
-            if let Some(val) = opts.get_item("aws_allow_http")? {
-                config.aws_allow_http = val.extract()?;
-            }
-            config
-        } else {
-            StorageConfig::from_env()
-        };
+        let storage_config = parse_storage_options(storage_options)?;
 
         let runtime = Runtime::new().map_err(|e| {
             DeltaFusionError::Runtime(format!("Failed to create Tokio runtime: {}", e))
@@ -64,8 +165,10 @@ impl PyDeltaEngine {
         let engine = DeltaEngine::with_config(storage_config);
 
         Ok(Self {
-            engine: Arc::new(tokio::sync::Mutex::new(engine)),
-            runtime: Arc::new(runtime),
+            executor: AsyncExecutor::new(
+                Arc::new(tokio::sync::Mutex::new(engine)),
+                Arc::new(runtime),
+            ),
         })
     }
 
@@ -82,66 +185,34 @@ impl PyDeltaEngine {
         path: String,
         version: Option<i64>,
     ) -> PyResult<()> {
-        let engine = Arc::clone(&self.engine);
-        let runtime = Arc::clone(&self.runtime);
-
-        py.allow_threads(|| {
-            runtime.block_on(async {
-                let mut engine = engine.lock().await;
+        self.executor.run(py, |engine| {
+            Box::pin(async move {
                 if let Some(v) = version {
                     engine.register_table_with_version(&name, &path, v).await
                 } else {
                     engine.register_table(&name, &path).await
                 }
             })
-        })?;
-
-        Ok(())
+        })
     }
 
     /// Refresh a registered table to load latest changes.
     fn refresh_table(&self, py: Python<'_>, name: String) -> PyResult<()> {
-        let engine = Arc::clone(&self.engine);
-        let runtime = Arc::clone(&self.runtime);
-
-        py.allow_threads(|| {
-            runtime.block_on(async {
-                let mut engine = engine.lock().await;
-                engine.refresh_table(&name).await
-            })
-        })?;
-
-        Ok(())
+        self.executor.run(py, |engine| {
+            Box::pin(async move { engine.refresh_table(&name).await })
+        })
     }
 
     /// Refresh all registered tables.
     fn refresh_all(&self, py: Python<'_>) -> PyResult<()> {
-        let engine = Arc::clone(&self.engine);
-        let runtime = Arc::clone(&self.runtime);
-
-        py.allow_threads(|| {
-            runtime.block_on(async {
-                let mut engine = engine.lock().await;
-                engine.refresh_all().await
-            })
-        })?;
-
-        Ok(())
+        self.executor.run(py, |engine| {
+            Box::pin(async move { engine.refresh_all().await })
+        })
     }
 
     /// Deregister a table.
     fn deregister_table(&self, py: Python<'_>, name: String) -> PyResult<()> {
-        let engine = Arc::clone(&self.engine);
-        let runtime = Arc::clone(&self.runtime);
-
-        py.allow_threads(|| {
-            runtime.block_on(async {
-                let mut engine = engine.lock().await;
-                engine.deregister_table(&name)
-            })
-        })?;
-
-        Ok(())
+        self.executor.run_sync(py, |engine| engine.deregister_table(&name))
     }
 
     // ========================================================================
@@ -149,61 +220,33 @@ impl PyDeltaEngine {
     // ========================================================================
 
     /// Register a time series table configuration.
-    ///
-    /// This does NOT read any data - it just stores the configuration.
-    /// Use `read_time_range` to actually query data.
-    ///
-    /// Args:
-    ///     name: Name for the time series
-    ///     path: Base path to the data (e.g., "s3://bucket/sensor_data")
-    ///     partition_col: Partition column name (e.g., "dt")
-    ///     timestamp_col: Timestamp column name in parquet files
-    ///     partition_format: Optional partition date format (default: "%Y-%m-%d")
-    #[pyo3(signature = (name, path, partition_col, timestamp_col, partition_format=None))]
+    #[pyo3(signature = (name, path, timestamp_col, partition_col="date", partition_format=None))]
     fn register_time_series(
         &self,
         py: Python<'_>,
         name: String,
         path: String,
-        partition_col: String,
         timestamp_col: String,
+        partition_col: &str,
         partition_format: Option<String>,
     ) -> PyResult<()> {
-        let engine = Arc::clone(&self.engine);
-        let runtime = Arc::clone(&self.runtime);
-
-        py.allow_threads(|| {
-            runtime.block_on(async {
-                let mut engine = engine.lock().await;
-                if let Some(fmt) = partition_format {
-                    engine.register_time_series_with_format(
-                        &name,
-                        &path,
-                        &partition_col,
-                        &timestamp_col,
-                        &fmt,
-                    );
-                } else {
-                    engine.register_time_series(&name, &path, &partition_col, &timestamp_col);
-                }
-                Ok::<(), DeltaFusionError>(())
-            })
-        })?;
-
-        Ok(())
+        self.executor.run_sync(py, |engine| {
+            if let Some(fmt) = partition_format {
+                engine.register_time_series_with_format(
+                    &name,
+                    &path,
+                    partition_col,
+                    &timestamp_col,
+                    &fmt,
+                );
+            } else {
+                engine.register_time_series(&name, &path, partition_col, &timestamp_col);
+            }
+            Ok(())
+        })
     }
 
     /// Read time range data directly from parquet files.
-    ///
-    /// This bypasses Delta log entirely for maximum performance.
-    ///
-    /// Args:
-    ///     name: Registered time series name
-    ///     start: Start timestamp (ISO 8601 format)
-    ///     end: End timestamp (ISO 8601 format)
-    ///
-    /// Returns:
-    ///     List of PyArrow RecordBatches
     fn read_time_range(
         &self,
         py: Python<'_>,
@@ -211,68 +254,40 @@ impl PyDeltaEngine {
         start: String,
         end: String,
     ) -> PyResult<Vec<PyObject>> {
-        let engine = Arc::clone(&self.engine);
-        let runtime = Arc::clone(&self.runtime);
-
-        let batches: Vec<RecordBatch> = py.allow_threads(|| {
-            runtime.block_on(async {
-                let engine = engine.lock().await;
-                engine.read_time_range(&name, &start, &end).await
-            })
+        let batches = self.executor.run_readonly(py, |engine| {
+            Box::pin(async move { engine.read_time_range(&name, &start, &end).await })
         })?;
-
-        batches.into_iter().map(|batch| batch.to_pyarrow(py)).collect()
+        batches_to_pyarrow(py, batches)
     }
 
     /// Read time range directly from a path (without pre-registration).
-    ///
-    /// Args:
-    ///     path: Base path to the data
-    ///     partition_col: Partition column name (e.g., "dt")
-    ///     timestamp_col: Timestamp column name in parquet files
-    ///     start: Start timestamp (ISO 8601 format)
-    ///     end: End timestamp (ISO 8601 format)
-    ///
-    /// Returns:
-    ///     List of PyArrow RecordBatches
+    #[pyo3(signature = (path, timestamp_col, start, end, partition_col="date"))]
     fn read_time_range_direct(
         &self,
         py: Python<'_>,
         path: String,
-        partition_col: String,
         timestamp_col: String,
         start: String,
         end: String,
+        partition_col: &str,
     ) -> PyResult<Vec<PyObject>> {
-        let engine = Arc::clone(&self.engine);
-        let runtime = Arc::clone(&self.runtime);
-
-        let batches: Vec<RecordBatch> = py.allow_threads(|| {
-            runtime.block_on(async {
-                let engine = engine.lock().await;
+        let batches = self.executor.run_readonly(py, |engine| {
+            let partition_col = partition_col.to_string();
+            Box::pin(async move {
                 engine
                     .read_time_range_direct(&path, &partition_col, &timestamp_col, &start, &end)
                     .await
             })
         })?;
-
-        batches.into_iter().map(|batch| batch.to_pyarrow(py)).collect()
+        batches_to_pyarrow(py, batches)
     }
 
     /// Deregister a time series.
     fn deregister_time_series(&self, py: Python<'_>, name: String) -> PyResult<()> {
-        let engine = Arc::clone(&self.engine);
-        let runtime = Arc::clone(&self.runtime);
-
-        py.allow_threads(|| {
-            runtime.block_on(async {
-                let mut engine = engine.lock().await;
-                engine.deregister_time_series(&name);
-                Ok::<(), DeltaFusionError>(())
-            })
-        })?;
-
-        Ok(())
+        self.executor.run_sync(py, |engine| {
+            engine.deregister_time_series(&name);
+            Ok(())
+        })
     }
 
     // ========================================================================
@@ -281,48 +296,19 @@ impl PyDeltaEngine {
 
     /// Execute a SQL query and return results as PyArrow RecordBatches.
     fn query(&self, py: Python<'_>, sql: String) -> PyResult<Vec<PyObject>> {
-        let engine = Arc::clone(&self.engine);
-        let runtime = Arc::clone(&self.runtime);
-
-        let batches: Vec<RecordBatch> = py.allow_threads(|| {
-            runtime.block_on(async {
-                let engine = engine.lock().await;
-                engine.query(&sql).await
-            })
+        let batches = self.executor.run_readonly(py, |engine| {
+            Box::pin(async move { engine.query(&sql).await })
         })?;
-
-        batches.into_iter().map(|batch| batch.to_pyarrow(py)).collect()
+        batches_to_pyarrow(py, batches)
     }
 
     /// Execute a SQL query and return results as a list of dictionaries.
-    ///
-    /// WARNING: This method copies data row-by-row and is slow for large datasets.
     fn query_to_dicts(&self, py: Python<'_>, sql: String) -> PyResult<Py<PyList>> {
-        let engine = Arc::clone(&self.engine);
-        let runtime = Arc::clone(&self.runtime);
-
-        let batches: Vec<RecordBatch> = py.allow_threads(|| {
-            runtime.block_on(async {
-                let engine = engine.lock().await;
-                engine.query(&sql).await
-            })
+        let batches: Vec<RecordBatch> = self.executor.run_readonly(py, |engine| {
+            Box::pin(async move { engine.query(&sql).await })
         })?;
 
-        let result = PyList::empty_bound(py);
-        for batch in batches {
-            let schema = batch.schema();
-            for row_idx in 0..batch.num_rows() {
-                let row_dict = PyDict::new_bound(py);
-                for (col_idx, field) in schema.fields().iter().enumerate() {
-                    let column = batch.column(col_idx);
-                    let value = arrow_value_to_py(py, column, row_idx)?;
-                    row_dict.set_item(field.name(), value)?;
-                }
-                result.append(row_dict)?;
-            }
-        }
-
-        Ok(result.into())
+        batches_to_dict_list(py, &batches)
     }
 
     // ========================================================================
@@ -331,14 +317,8 @@ impl PyDeltaEngine {
 
     /// Get information about a Delta table.
     fn table_info(&self, py: Python<'_>, name_or_path: String) -> PyResult<Py<PyDict>> {
-        let engine = Arc::clone(&self.engine);
-        let runtime = Arc::clone(&self.runtime);
-
-        let info = py.allow_threads(|| {
-            runtime.block_on(async {
-                let engine = engine.lock().await;
-                engine.table_info(&name_or_path).await
-            })
+        let info = self.executor.run_readonly(py, |engine| {
+            Box::pin(async move { engine.table_info(&name_or_path).await })
         })?;
 
         let result = PyDict::new_bound(py);
@@ -353,54 +333,22 @@ impl PyDeltaEngine {
 
     /// List all registered table names.
     fn list_tables(&self, py: Python<'_>) -> PyResult<Vec<String>> {
-        let engine = Arc::clone(&self.engine);
-        let runtime = Arc::clone(&self.runtime);
-
-        py.allow_threads(|| {
-            runtime.block_on(async {
-                let engine = engine.lock().await;
-                Ok(engine.list_tables())
-            })
-        })
+        self.executor.run_sync(py, |engine| Ok(engine.list_tables()))
     }
 
     /// List all registered time series names.
     fn list_time_series(&self, py: Python<'_>) -> PyResult<Vec<String>> {
-        let engine = Arc::clone(&self.engine);
-        let runtime = Arc::clone(&self.runtime);
-
-        py.allow_threads(|| {
-            runtime.block_on(async {
-                let engine = engine.lock().await;
-                Ok(engine.list_time_series())
-            })
-        })
+        self.executor.run_sync(py, |engine| Ok(engine.list_time_series()))
     }
 
     /// Check if a table is registered.
     fn is_registered(&self, py: Python<'_>, name: String) -> PyResult<bool> {
-        let engine = Arc::clone(&self.engine);
-        let runtime = Arc::clone(&self.runtime);
-
-        py.allow_threads(|| {
-            runtime.block_on(async {
-                let engine = engine.lock().await;
-                Ok(engine.is_registered(&name))
-            })
-        })
+        self.executor.run_sync(py, |engine| Ok(engine.is_registered(&name)))
     }
 
     /// Check if a time series is registered.
     fn is_time_series_registered(&self, py: Python<'_>, name: String) -> PyResult<bool> {
-        let engine = Arc::clone(&self.engine);
-        let runtime = Arc::clone(&self.runtime);
-
-        py.allow_threads(|| {
-            runtime.block_on(async {
-                let engine = engine.lock().await;
-                Ok(engine.is_time_series_registered(&name))
-            })
-        })
+        self.executor.run_sync(py, |engine| Ok(engine.is_time_series_registered(&name)))
     }
 
     // ========================================================================
@@ -408,11 +356,6 @@ impl PyDeltaEngine {
     // ========================================================================
 
     /// Create a new Delta table at the specified path.
-    ///
-    /// Args:
-    ///     path: Path where the table will be created
-    ///     schema: PyArrow schema for the table
-    ///     partition_columns: Optional list of partition column names
     #[pyo3(signature = (path, schema, partition_columns=None))]
     fn create_table(
         &self,
@@ -421,29 +364,16 @@ impl PyDeltaEngine {
         schema: PyObject,
         partition_columns: Option<Vec<String>>,
     ) -> PyResult<()> {
-        use arrow::pyarrow::FromPyArrow;
-
         let arrow_schema = arrow::datatypes::Schema::from_pyarrow_bound(schema.bind(py))?;
-        let engine = Arc::clone(&self.engine);
-        let runtime = Arc::clone(&self.runtime);
 
-        py.allow_threads(|| {
-            runtime.block_on(async {
-                let engine = engine.lock().await;
-                engine.create_table(&path, &arrow_schema, partition_columns).await
+        self.executor.run_readonly(py, |engine| {
+            Box::pin(async move {
+                engine.create_table(&path, &arrow_schema, partition_columns).await.map(|_| ())
             })
-        })?;
-
-        Ok(())
+        })
     }
 
     /// Write RecordBatches to a Delta table.
-    ///
-    /// Args:
-    ///     path: Path to the Delta table
-    ///     data: PyArrow Table or list of RecordBatches
-    ///     mode: Write mode - "append", "overwrite", "error", or "ignore"
-    ///     partition_columns: Optional partition columns (for new tables)
     #[pyo3(signature = (path, data, mode="append", partition_columns=None))]
     fn write(
         &self,
@@ -453,64 +383,17 @@ impl PyDeltaEngine {
         mode: &str,
         partition_columns: Option<Vec<String>>,
     ) -> PyResult<()> {
-        use arrow::pyarrow::FromPyArrow;
-        use crate::engine::WriteMode;
+        let write_mode = parse_write_mode(mode, true)?;
+        let batches = pyarrow_to_batches(py, &data)?;
 
-        let write_mode = match mode {
-            "append" => WriteMode::Append,
-            "overwrite" => WriteMode::Overwrite,
-            "error" => WriteMode::ErrorIfExists,
-            "ignore" => WriteMode::Ignore,
-            _ => {
-                return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "Invalid mode: {}. Use 'append', 'overwrite', 'error', or 'ignore'",
-                    mode
-                )));
-            }
-        };
-
-        // Convert data to RecordBatches
-        let batches: Vec<RecordBatch> = {
-            // Check if it's a PyArrow Table by checking for to_batches method
-            let data_bound = data.bind(py);
-            if data_bound.hasattr("to_batches")? {
-                // It's a Table - convert to batches
-                let batch_list = data_bound.call_method0("to_batches")?;
-                let batch_vec = batch_list.extract::<Vec<PyObject>>()?;
-                batch_vec
-                    .into_iter()
-                    .map(|obj| RecordBatch::from_pyarrow_bound(obj.bind(py)))
-                    .collect::<Result<Vec<_>, _>>()?
-            } else if let Ok(list) = data.extract::<Vec<PyObject>>(py) {
-                // It's a list of RecordBatches
-                list.into_iter()
-                    .map(|obj| RecordBatch::from_pyarrow_bound(obj.bind(py)))
-                    .collect::<Result<Vec<_>, _>>()?
-            } else {
-                // Try as a single RecordBatch
-                vec![RecordBatch::from_pyarrow_bound(data_bound)?]
-            }
-        };
-
-        let engine = Arc::clone(&self.engine);
-        let runtime = Arc::clone(&self.runtime);
-
-        py.allow_threads(|| {
-            runtime.block_on(async {
-                let engine = engine.lock().await;
-                engine.write(&path, batches, write_mode, partition_columns).await
+        self.executor.run_readonly(py, |engine| {
+            Box::pin(async move {
+                engine.write(&path, batches, write_mode, partition_columns).await.map(|_| ())
             })
-        })?;
-
-        Ok(())
+        })
     }
 
     /// Write data to a registered table by name.
-    ///
-    /// Args:
-    ///     name: Registered table name
-    ///     data: PyArrow Table or list of RecordBatches
-    ///     mode: Write mode - "append" or "overwrite"
     #[pyo3(signature = (name, data, mode="append"))]
     fn write_to_table(
         &self,
@@ -519,51 +402,62 @@ impl PyDeltaEngine {
         data: PyObject,
         mode: &str,
     ) -> PyResult<()> {
-        use arrow::pyarrow::FromPyArrow;
-        use crate::engine::WriteMode;
+        let write_mode = parse_write_mode(mode, false)?;
+        let batches = pyarrow_to_batches(py, &data)?;
 
-        let write_mode = match mode {
-            "append" => WriteMode::Append,
-            "overwrite" => WriteMode::Overwrite,
-            _ => {
-                return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "Invalid mode: {}. Use 'append' or 'overwrite'",
-                    mode
-                )));
-            }
-        };
-
-        // Convert data to RecordBatches
-        let batches: Vec<RecordBatch> = {
-            let data_bound = data.bind(py);
-            if data_bound.hasattr("to_batches")? {
-                let batch_list = data_bound.call_method0("to_batches")?;
-                let batch_vec = batch_list.extract::<Vec<PyObject>>()?;
-                batch_vec
-                    .into_iter()
-                    .map(|obj| RecordBatch::from_pyarrow_bound(obj.bind(py)))
-                    .collect::<Result<Vec<_>, _>>()?
-            } else if let Ok(list) = data.extract::<Vec<PyObject>>(py) {
-                list.into_iter()
-                    .map(|obj| RecordBatch::from_pyarrow_bound(obj.bind(py)))
-                    .collect::<Result<Vec<_>, _>>()?
-            } else {
-                vec![RecordBatch::from_pyarrow_bound(data_bound)?]
-            }
-        };
-
-        let engine = Arc::clone(&self.engine);
-        let runtime = Arc::clone(&self.runtime);
-
-        py.allow_threads(|| {
-            runtime.block_on(async {
-                let mut engine = engine.lock().await;
-                engine.write_to_table(&name, batches, write_mode).await
-            })
-        })?;
-
-        Ok(())
+        self.executor.run(py, |engine| {
+            Box::pin(async move { engine.write_to_table(&name, batches, write_mode).await })
+        })
     }
+}
+
+// =============================================================================
+// Helper Functions
+// =============================================================================
+
+/// Parse storage options from Python dict.
+fn parse_storage_options(opts: Option<&Bound<'_, PyDict>>) -> PyResult<StorageConfig> {
+    if let Some(opts) = opts {
+        let mut builder = StorageConfig::builder();
+        if let Some(val) = opts.get_item("aws_access_key_id")? {
+            builder = builder.aws_access_key_id(val.extract::<String>()?);
+        }
+        if let Some(val) = opts.get_item("aws_secret_access_key")? {
+            builder = builder.aws_secret_access_key(val.extract::<String>()?);
+        }
+        if let Some(val) = opts.get_item("aws_region")? {
+            builder = builder.aws_region(val.extract::<String>()?);
+        }
+        if let Some(val) = opts.get_item("aws_endpoint")? {
+            builder = builder.aws_endpoint(val.extract::<String>()?);
+        }
+        if let Some(val) = opts.get_item("aws_allow_http")? {
+            builder = builder.aws_allow_http(val.extract()?);
+        }
+        Ok(builder.build())
+    } else {
+        Ok(StorageConfig::from_env())
+    }
+}
+
+/// Convert RecordBatches to a list of Python dictionaries.
+fn batches_to_dict_list(py: Python<'_>, batches: &[RecordBatch]) -> PyResult<Py<PyList>> {
+    let result = PyList::empty_bound(py);
+
+    for batch in batches {
+        let schema = batch.schema();
+        for row_idx in 0..batch.num_rows() {
+            let row_dict = PyDict::new_bound(py);
+            for (col_idx, field) in schema.fields().iter().enumerate() {
+                let column = batch.column(col_idx);
+                let value = arrow_value_to_py(py, column, row_idx)?;
+                row_dict.set_item(field.name(), value)?;
+            }
+            result.append(row_dict)?;
+        }
+    }
+
+    Ok(result.into())
 }
 
 /// Convert an Arrow array value at a specific index to a Python object.
@@ -579,72 +473,35 @@ fn arrow_value_to_py(
         return Ok(py.None());
     }
 
+    // Macro to reduce repetition for primitive types
+    macro_rules! extract_value {
+        ($array_type:ty, $array:expr, $idx:expr) => {{
+            let arr = $array.as_any().downcast_ref::<$array_type>().unwrap();
+            arr.value($idx).to_object(py)
+        }};
+    }
+
     let value: PyObject = match array.data_type() {
-        DataType::Boolean => {
-            let arr = array.as_any().downcast_ref::<BooleanArray>().unwrap();
-            arr.value(idx).to_object(py)
-        }
-        DataType::Int8 => {
-            let arr = array.as_any().downcast_ref::<Int8Array>().unwrap();
-            arr.value(idx).to_object(py)
-        }
-        DataType::Int16 => {
-            let arr = array.as_any().downcast_ref::<Int16Array>().unwrap();
-            arr.value(idx).to_object(py)
-        }
-        DataType::Int32 => {
-            let arr = array.as_any().downcast_ref::<Int32Array>().unwrap();
-            arr.value(idx).to_object(py)
-        }
-        DataType::Int64 => {
-            let arr = array.as_any().downcast_ref::<Int64Array>().unwrap();
-            arr.value(idx).to_object(py)
-        }
-        DataType::UInt8 => {
-            let arr = array.as_any().downcast_ref::<UInt8Array>().unwrap();
-            arr.value(idx).to_object(py)
-        }
-        DataType::UInt16 => {
-            let arr = array.as_any().downcast_ref::<UInt16Array>().unwrap();
-            arr.value(idx).to_object(py)
-        }
-        DataType::UInt32 => {
-            let arr = array.as_any().downcast_ref::<UInt32Array>().unwrap();
-            arr.value(idx).to_object(py)
-        }
-        DataType::UInt64 => {
-            let arr = array.as_any().downcast_ref::<UInt64Array>().unwrap();
-            arr.value(idx).to_object(py)
-        }
-        DataType::Float32 => {
-            let arr = array.as_any().downcast_ref::<Float32Array>().unwrap();
-            arr.value(idx).to_object(py)
-        }
-        DataType::Float64 => {
-            let arr = array.as_any().downcast_ref::<Float64Array>().unwrap();
-            arr.value(idx).to_object(py)
-        }
-        DataType::Utf8 => {
-            let arr = array.as_any().downcast_ref::<StringArray>().unwrap();
-            arr.value(idx).to_object(py)
-        }
-        DataType::LargeUtf8 => {
-            let arr = array.as_any().downcast_ref::<LargeStringArray>().unwrap();
-            arr.value(idx).to_object(py)
-        }
-        DataType::Date32 => {
-            let arr = array.as_any().downcast_ref::<Date32Array>().unwrap();
-            arr.value(idx).to_object(py)
-        }
-        DataType::Date64 => {
-            let arr = array.as_any().downcast_ref::<Date64Array>().unwrap();
-            arr.value(idx).to_object(py)
-        }
+        DataType::Boolean => extract_value!(BooleanArray, array, idx),
+        DataType::Int8 => extract_value!(Int8Array, array, idx),
+        DataType::Int16 => extract_value!(Int16Array, array, idx),
+        DataType::Int32 => extract_value!(Int32Array, array, idx),
+        DataType::Int64 => extract_value!(Int64Array, array, idx),
+        DataType::UInt8 => extract_value!(UInt8Array, array, idx),
+        DataType::UInt16 => extract_value!(UInt16Array, array, idx),
+        DataType::UInt32 => extract_value!(UInt32Array, array, idx),
+        DataType::UInt64 => extract_value!(UInt64Array, array, idx),
+        DataType::Float32 => extract_value!(Float32Array, array, idx),
+        DataType::Float64 => extract_value!(Float64Array, array, idx),
+        DataType::Utf8 => extract_value!(StringArray, array, idx),
+        DataType::LargeUtf8 => extract_value!(LargeStringArray, array, idx),
+        DataType::Date32 => extract_value!(Date32Array, array, idx),
+        DataType::Date64 => extract_value!(Date64Array, array, idx),
         _ => {
             // Fallback: convert to string representation
-            let arr = arrow::util::display::array_value_to_string(array, idx)
-                .unwrap_or_else(|_| "".to_string());
-            arr.to_object(py)
+            arrow::util::display::array_value_to_string(array, idx)
+                .unwrap_or_default()
+                .to_object(py)
         }
     };
 
