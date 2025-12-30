@@ -412,7 +412,16 @@ impl PyDeltaEngine {
     }
 
     /// Write RecordBatches to a Delta table.
-    #[pyo3(signature = (path, data, mode="append", partition_columns=None))]
+    ///
+    /// Args:
+    ///     path: Path to the Delta table
+    ///     data: PyArrow Table or list of RecordBatches
+    ///     mode: Write mode ("append", "overwrite", "error", "ignore")
+    ///     partition_columns: Optional partition columns (for new tables)
+    ///     schema_mode: Schema evolution mode ("merge" or "overwrite")
+    ///         - "merge": Add new columns to existing schema
+    ///         - "overwrite": Replace schema entirely
+    #[pyo3(signature = (path, data, mode="append", partition_columns=None, schema_mode=None))]
     fn write(
         &self,
         py: Python<'_>,
@@ -420,13 +429,17 @@ impl PyDeltaEngine {
         data: PyObject,
         mode: &str,
         partition_columns: Option<Vec<String>>,
+        schema_mode: Option<String>,
     ) -> PyResult<()> {
         let write_mode = parse_write_mode(mode, true)?;
         let batches = pyarrow_to_batches(py, &data)?;
 
         self.executor.run_readonly(py, |engine| {
             Box::pin(async move {
-                engine.write(&path, batches, write_mode, partition_columns).await.map(|_| ())
+                engine
+                    .write_with_options(&path, batches, write_mode, partition_columns, schema_mode)
+                    .await
+                    .map(|_| ())
             })
         })
     }

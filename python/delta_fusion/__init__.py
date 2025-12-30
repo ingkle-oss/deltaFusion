@@ -290,11 +290,12 @@ class DeltaEngine:
         data: "pa.Table | list[pa.RecordBatch]",
         mode: str = "append",
         partition_columns: list[str] | None = None,
+        schema_mode: str | None = None,
     ) -> None:
         """Write data to a Delta table.
 
         Creates the table if it doesn't exist. For existing tables,
-        schema must be compatible.
+        new columns are automatically added (merge mode by default).
 
         Args:
             path: Path to the Delta table
@@ -305,14 +306,26 @@ class DeltaEngine:
                 - "error": Fail if table exists
                 - "ignore": Do nothing if table exists
             partition_columns: Partition columns (only for new tables)
+            schema_mode: Schema evolution mode:
+                - "merge": Automatically add new columns (default for append)
+                - "overwrite": Replace the table schema with the new schema
+                - None: Uses "merge" for append mode
 
         Example:
             >>> import pyarrow as pa
             >>> table = pa.table({"id": [1, 2], "name": ["a", "b"]})
             >>> engine.write("/path/to/table", table)
-            >>> engine.write("/path/to/table", table, mode="overwrite")
+
+            # New columns are automatically merged
+            >>> new_data = pa.table({"id": [3], "name": ["c"], "age": [25]})
+            >>> engine.write("/path/to/table", new_data)  # age column auto-added
         """
-        self._engine.write(path, data, mode, partition_columns)
+        # Default to merge mode for append to support schema evolution
+        effective_schema_mode = schema_mode
+        if effective_schema_mode is None and mode == "append":
+            effective_schema_mode = "merge"
+
+        self._engine.write(path, data, mode, partition_columns, effective_schema_mode)
 
     def write_to_table(
         self,

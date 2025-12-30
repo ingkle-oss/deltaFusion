@@ -8,6 +8,7 @@ use arrow::datatypes::Schema as ArrowSchema;
 use arrow::record_batch::RecordBatch;
 use datafusion::prelude::*;
 use deltalake::kernel::{ArrayType, DataType, MapType, PrimitiveType, StructField, StructType};
+use deltalake::operations::write::SchemaMode;
 use deltalake::operations::DeltaOps;
 use deltalake::protocol::SaveMode;
 use deltalake::DeltaTable;
@@ -504,6 +505,29 @@ impl DeltaEngine {
         mode: WriteMode,
         partition_columns: Option<Vec<String>>,
     ) -> Result<DeltaTable> {
+        self.write_with_options(path, batches, mode, partition_columns, None)
+            .await
+    }
+
+    /// Write RecordBatches with schema evolution options.
+    ///
+    /// # Arguments
+    /// * `path` - Path to the Delta table
+    /// * `batches` - Data to write
+    /// * `mode` - Write mode (Append or Overwrite)
+    /// * `partition_columns` - Optional partition columns (only used when creating new table)
+    /// * `schema_mode` - Schema mode: "merge" to add new columns, "overwrite" to replace schema
+    ///
+    /// # Returns
+    /// The updated DeltaTable
+    pub async fn write_with_options(
+        &self,
+        path: &str,
+        batches: Vec<RecordBatch>,
+        mode: WriteMode,
+        partition_columns: Option<Vec<String>>,
+        schema_mode: Option<String>,
+    ) -> Result<DeltaTable> {
         if batches.is_empty() {
             return Err(DeltaFusionError::Write("No data to write".to_string()));
         }
@@ -523,6 +547,21 @@ impl DeltaEngine {
 
         if let Some(cols) = partition_columns {
             builder = builder.with_partition_columns(cols);
+        }
+
+        // Apply schema mode if specified
+        if let Some(ref mode_str) = schema_mode {
+            let schema_mode = match mode_str.to_lowercase().as_str() {
+                "merge" => SchemaMode::Merge,
+                "overwrite" => SchemaMode::Overwrite,
+                _ => {
+                    return Err(DeltaFusionError::InvalidConfig(format!(
+                        "Invalid schema_mode: '{}'. Use 'merge' or 'overwrite'",
+                        mode_str
+                    )))
+                }
+            };
+            builder = builder.with_schema_mode(schema_mode);
         }
 
         let table = builder.await?;
