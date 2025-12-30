@@ -24,3 +24,6 @@ venv/
 
 # maturin
 *.whl
+
+# claude
+/.claude

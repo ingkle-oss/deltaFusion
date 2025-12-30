@@ -8,15 +8,27 @@ use datafusion::prelude::*;
 use deltalake::DeltaTable;
 
 use crate::config::StorageConfig;
-use crate::error::Result;
+use crate::error::{DeltaFusionError, Result};
+
+/// Cached table entry with metadata.
+struct CachedTable {
+    /// The Delta table instance.
+    table: Arc<DeltaTable>,
+    /// Original path for refresh.
+    path: String,
+    /// Version when loaded (None if loaded at latest).
+    loaded_version: Option<i64>,
+}
 
 /// DeltaEngine provides SQL query capabilities over Delta Lake tables.
 ///
 /// Uses DataFusion as the query engine with zero-copy Arrow data transfer.
+/// Tables are cached after registration to avoid repeated log replay.
 pub struct DeltaEngine {
     ctx: SessionContext,
     storage_config: StorageConfig,
-    registered_tables: HashMap<String, String>,
+    /// Cached tables: name -> CachedTable
+    tables: HashMap<String, CachedTable>,
 }
 
 impl DeltaEngine {
@@ -31,22 +43,35 @@ impl DeltaEngine {
         Self {
             ctx,
             storage_config,
-            registered_tables: HashMap::new(),
+            tables: HashMap::new(),
         }
     }
 
     /// Register a Delta table with the given name.
     ///
-    /// The table can then be queried using SQL with this name.
+    /// The table is cached after loading to avoid repeated log replay.
+    /// Use `refresh_table` to reload the table with latest changes.
     pub async fn register_table(&mut self, name: &str, path: &str) -> Result<()> {
         let table = self.open_delta_table(path).await?;
-        self.ctx.register_table(name, Arc::new(table))?;
-        self.registered_tables
-            .insert(name.to_string(), path.to_string());
+        let arc_table = Arc::new(table);
+
+        self.ctx.register_table(name, arc_table.clone())?;
+
+        self.tables.insert(
+            name.to_string(),
+            CachedTable {
+                table: arc_table,
+                path: path.to_string(),
+                loaded_version: None,
+            },
+        );
+
         Ok(())
     }
 
     /// Register a Delta table at a specific version.
+    ///
+    /// The table is cached at the specified version.
     pub async fn register_table_with_version(
         &mut self,
         name: &str,
@@ -55,9 +80,65 @@ impl DeltaEngine {
     ) -> Result<()> {
         let mut table = self.open_delta_table(path).await?;
         table.load_version(version).await?;
-        self.ctx.register_table(name, Arc::new(table))?;
-        self.registered_tables
-            .insert(name.to_string(), path.to_string());
+        let arc_table = Arc::new(table);
+
+        self.ctx.register_table(name, arc_table.clone())?;
+
+        self.tables.insert(
+            name.to_string(),
+            CachedTable {
+                table: arc_table,
+                path: path.to_string(),
+                loaded_version: Some(version),
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Refresh a registered table to load latest changes.
+    ///
+    /// This reloads the table from storage, picking up any new commits.
+    /// If the table was registered at a specific version, it stays at that version.
+    pub async fn refresh_table(&mut self, name: &str) -> Result<()> {
+        let cached = self
+            .tables
+            .get(name)
+            .ok_or_else(|| DeltaFusionError::TableNotFound(name.to_string()))?;
+
+        let path = cached.path.clone();
+        let loaded_version = cached.loaded_version;
+
+        // Deregister old table
+        self.ctx.deregister_table(name)?;
+
+        // Reload table
+        let mut table = self.open_delta_table(&path).await?;
+        if let Some(version) = loaded_version {
+            table.load_version(version).await?;
+        }
+        let arc_table = Arc::new(table);
+
+        self.ctx.register_table(name, arc_table.clone())?;
+
+        self.tables.insert(
+            name.to_string(),
+            CachedTable {
+                table: arc_table,
+                path,
+                loaded_version,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Refresh all registered tables.
+    pub async fn refresh_all(&mut self) -> Result<()> {
+        let names: Vec<String> = self.tables.keys().cloned().collect();
+        for name in names {
+            self.refresh_table(&name).await?;
+        }
         Ok(())
     }
 
@@ -76,21 +157,44 @@ impl DeltaEngine {
         Ok(df)
     }
 
-    /// Get table metadata including schema and version.
-    pub async fn table_info(&self, path: &str) -> Result<TableInfo> {
-        let table = self.open_delta_table(path).await?;
+    /// Get table metadata from cache (no I/O if already registered).
+    ///
+    /// If the table is registered, uses cached metadata.
+    /// Otherwise, opens the table fresh (use `register_table` to cache it).
+    pub async fn table_info(&self, name_or_path: &str) -> Result<TableInfo> {
+        // First check if it's a registered table name
+        if let Some(cached) = self.tables.get(name_or_path) {
+            return self.extract_table_info(&cached.table, &cached.path);
+        }
 
+        // Otherwise treat as path and open fresh (not cached)
+        let table = self.open_delta_table(name_or_path).await?;
+        self.extract_table_info(&table, name_or_path)
+    }
+
+    /// Get info for a registered table by name.
+    pub fn registered_table_info(&self, name: &str) -> Result<TableInfo> {
+        let cached = self
+            .tables
+            .get(name)
+            .ok_or_else(|| DeltaFusionError::TableNotFound(name.to_string()))?;
+
+        self.extract_table_info(&cached.table, &cached.path)
+    }
+
+    /// Extract TableInfo from a DeltaTable.
+    fn extract_table_info(&self, table: &DeltaTable, path: &str) -> Result<TableInfo> {
         let version = table.version();
         let schema = table.get_schema()?.clone();
         let num_files = table.get_files_count();
 
-        // Get partition columns from metadata
         let partition_columns = table
             .metadata()
             .map(|m| m.partition_columns.clone())
             .unwrap_or_default();
 
         Ok(TableInfo {
+            path: path.to_string(),
             version,
             schema: format!("{:?}", schema),
             num_files,
@@ -100,7 +204,19 @@ impl DeltaEngine {
 
     /// List all registered table names.
     pub fn list_tables(&self) -> Vec<String> {
-        self.registered_tables.keys().cloned().collect()
+        self.tables.keys().cloned().collect()
+    }
+
+    /// Check if a table is registered.
+    pub fn is_registered(&self, name: &str) -> bool {
+        self.tables.contains_key(name)
+    }
+
+    /// Deregister a table.
+    pub fn deregister_table(&mut self, name: &str) -> Result<()> {
+        self.ctx.deregister_table(name)?;
+        self.tables.remove(name);
+        Ok(())
     }
 
     /// Open a Delta table with storage options.
@@ -129,6 +245,7 @@ impl Default for DeltaEngine {
 /// Information about a Delta table.
 #[derive(Debug, Clone)]
 pub struct TableInfo {
+    pub path: String,
     pub version: i64,
     pub schema: String,
     pub num_files: usize,
@@ -143,5 +260,11 @@ mod tests {
     async fn test_engine_creation() {
         let engine = DeltaEngine::new();
         assert!(engine.list_tables().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_is_registered() {
+        let engine = DeltaEngine::new();
+        assert!(!engine.is_registered("nonexistent"));
     }
 }
