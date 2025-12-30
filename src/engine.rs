@@ -1,11 +1,11 @@
 //! Core DeltaEngine implementation with DataFusion integration.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
 use arrow::datatypes::Schema as ArrowSchema;
 use arrow::record_batch::RecordBatch;
-use datafusion::datasource::listing::ListingOptions;
 use datafusion::prelude::*;
 use deltalake::kernel::{ArrayType, DataType, MapType, PrimitiveType, StructField, StructType};
 use deltalake::operations::DeltaOps;
@@ -14,7 +14,7 @@ use deltalake::DeltaTable;
 
 use crate::config::StorageConfig;
 use crate::error::{DeltaFusionError, Result};
-use crate::time_series::{generate_partition_glob, parse_timestamp, TimeSeriesConfig};
+use crate::time_series::{generate_partition_paths, parse_timestamp, TimeSeriesConfig};
 
 /// Write mode for delta operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -214,69 +214,27 @@ impl DeltaEngine {
         let start_ts = parse_timestamp(start)?;
         let end_ts = parse_timestamp(end)?;
 
-        // Generate partition paths
-        let globs = generate_partition_glob(config, start_ts, end_ts);
+        // Generate partition paths (directories, not globs)
+        let partition_paths = generate_partition_paths(config, start_ts, end_ts);
 
-        if globs.is_empty() {
+        if partition_paths.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Find all parquet files in partition directories
+        let parquet_files = find_parquet_files(&partition_paths)?;
+
+        if parquet_files.is_empty() {
             return Ok(vec![]);
         }
 
         // Create a temporary session for this query
         let ctx = self.create_session_with_storage().await?;
 
-        // Register parquet files
-        let options = ListingOptions::new(Arc::new(
-            datafusion::datasource::file_format::parquet::ParquetFormat::default(),
-        ))
-        .with_file_extension(".parquet");
-
-        // Try to register all paths at once first
-        let table_paths: Vec<_> = globs.iter().map(|g| g.as_str()).collect();
-        let combined_path = table_paths.join(",");
-
-        let registration_result = ctx
-            .register_listing_table("_ts_temp", &combined_path, options.clone(), None, None)
-            .await;
-
-        if registration_result.is_err() {
-            // If combined registration fails, try registering paths individually
-            for (i, glob) in globs.iter().enumerate() {
-                let name = format!("_ts_part_{}", i);
-                let _ = ctx
-                    .register_listing_table(&name, glob, options.clone(), None, None)
-                    .await;
-            }
-        }
-
-        // Build query with timestamp filter
-        let batches = if registration_result.is_ok() {
-            // Combined table registered successfully
-            let sql = format!(
-                "SELECT * FROM _ts_temp WHERE {} >= '{}' AND {} < '{}'",
-                config.timestamp_col(), start, config.timestamp_col(), end
-            );
-            let df = ctx.sql(&sql).await?;
-            df.collect().await?
-        } else {
-            // Use union of individual partitions
-            let partition_count = globs.len();
-            let mut union_sql = String::new();
-            for i in 0..partition_count {
-                if i > 0 {
-                    union_sql.push_str(" UNION ALL ");
-                }
-                union_sql.push_str(&format!(
-                    "SELECT * FROM _ts_part_{} WHERE {} >= '{}' AND {} < '{}'",
-                    i, config.timestamp_col(), start, config.timestamp_col(), end
-                ));
-            }
-            match ctx.sql(&union_sql).await {
-                Ok(df) => df.collect().await?,
-                Err(_) => vec![], // No partitions found
-            }
-        };
-
-        Ok(batches)
+        // Register each parquet file and build union query
+        let timestamp_col = config.timestamp_col();
+        self.read_parquet_files_with_filter(&ctx, &parquet_files, timestamp_col, start, end)
+            .await
     }
 
     /// Read time range directly from a path (without pre-registration).
@@ -293,68 +251,58 @@ impl DeltaEngine {
         let start_ts = parse_timestamp(start)?;
         let end_ts = parse_timestamp(end)?;
 
-        let globs = generate_partition_glob(&config, start_ts, end_ts);
+        let partition_paths = generate_partition_paths(&config, start_ts, end_ts);
 
-        if globs.is_empty() {
+        if partition_paths.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Find all parquet files in partition directories
+        let parquet_files = find_parquet_files(&partition_paths)?;
+
+        if parquet_files.is_empty() {
             return Ok(vec![]);
         }
 
         let ctx = self.create_session_with_storage().await?;
 
-        // Register all partition paths
-        for (i, glob) in globs.iter().enumerate() {
-            let options = ListingOptions::new(Arc::new(
-                datafusion::datasource::file_format::parquet::ParquetFormat::default(),
-            ))
-            .with_file_extension(".parquet");
+        self.read_parquet_files_with_filter(&ctx, &parquet_files, timestamp_col, start, end)
+            .await
+    }
 
-            let table_name = format!("_part_{}", i);
-            if ctx
-                .register_listing_table(&table_name, glob, options, None, None)
-                .await
-                .is_err()
-            {
-                // Skip partitions that don't exist
-                continue;
-            }
-        }
-
-        // Union all partitions
-        let partition_count = globs.len();
-        if partition_count == 0 {
+    /// Read parquet files with timestamp filter.
+    async fn read_parquet_files_with_filter(
+        &self,
+        ctx: &SessionContext,
+        files: &[String],
+        timestamp_col: &str,
+        start: &str,
+        end: &str,
+    ) -> Result<Vec<RecordBatch>> {
+        if files.is_empty() {
             return Ok(vec![]);
         }
 
-        let mut union_sql = String::new();
-        for i in 0..partition_count {
-            if i > 0 {
-                union_sql.push_str(" UNION ALL ");
-            }
-            union_sql.push_str(&format!(
-                "SELECT * FROM _part_{} WHERE {} >= '{}' AND {} < '{}'",
+        // Register each parquet file as a separate table
+        for (i, file_path) in files.iter().enumerate() {
+            let table_name = format!("_ts_part_{}", i);
+            ctx.register_parquet(&table_name, file_path, Default::default())
+                .await?;
+        }
+
+        // Build UNION ALL query with timestamp filter
+        let mut union_parts = Vec::new();
+        for i in 0..files.len() {
+            union_parts.push(format!(
+                "SELECT * FROM _ts_part_{} WHERE {} >= '{}' AND {} < '{}'",
                 i, timestamp_col, start, timestamp_col, end
             ));
         }
 
-        // Try the union query, fall back to simpler approach if needed
-        let df = match ctx.sql(&union_sql).await {
-            Ok(df) => df,
-            Err(_) => {
-                // Fallback: try first available partition
-                for i in 0..partition_count {
-                    let sql = format!(
-                        "SELECT * FROM _part_{} WHERE {} >= '{}' AND {} < '{}'",
-                        i, timestamp_col, start, timestamp_col, end
-                    );
-                    if let Ok(df) = ctx.sql(&sql).await {
-                        return Ok(df.collect().await?);
-                    }
-                }
-                return Ok(vec![]);
-            }
-        };
-
+        let sql = union_parts.join(" UNION ALL ");
+        let df = ctx.sql(&sql).await?;
         let batches = df.collect().await?;
+
         Ok(batches)
     }
 
@@ -706,6 +654,42 @@ fn arrow_type_to_delta(arrow_type: &arrow::datatypes::DataType) -> Result<DataTy
     };
 
     Ok(delta_type)
+}
+
+/// Find all parquet files in the given partition directories.
+///
+/// Handles both local filesystem paths and cloud storage paths (S3).
+fn find_parquet_files(partition_paths: &[String]) -> Result<Vec<String>> {
+    let mut parquet_files = Vec::new();
+
+    for partition_path in partition_paths {
+        // Check if it's a local path or cloud storage
+        if partition_path.starts_with("s3://")
+            || partition_path.starts_with("gs://")
+            || partition_path.starts_with("az://")
+        {
+            // For cloud storage, we'll use the directory path and let DataFusion
+            // discover files. Return the partition path with glob pattern.
+            parquet_files.push(format!("{}/*.parquet", partition_path));
+        } else {
+            // Local filesystem - enumerate files directly
+            let path = Path::new(partition_path);
+            if path.exists() && path.is_dir() {
+                if let Ok(entries) = std::fs::read_dir(path) {
+                    for entry in entries.flatten() {
+                        let file_path = entry.path();
+                        if file_path.extension().map_or(false, |ext| ext == "parquet") {
+                            if let Some(path_str) = file_path.to_str() {
+                                parquet_files.push(path_str.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(parquet_files)
 }
 
 /// Information about a Delta table.
