@@ -241,26 +241,27 @@ impl DeltaEngine {
         let start_ts = parse_timestamp(start)?;
         let end_ts = parse_timestamp(end)?;
 
-        // Generate partition paths (directories, not globs)
+        // Generate partition paths (directories like /data/date=2024-01-15)
         let partition_paths = generate_partition_paths(config, start_ts, end_ts);
 
         if partition_paths.is_empty() {
             return Ok(vec![]);
         }
 
-        // Find all parquet files in partition directories
-        let parquet_files = find_parquet_files(&partition_paths)?;
+        // Filter to only existing directories that contain parquet files
+        let valid_partitions = filter_valid_partition_dirs(&partition_paths)?;
 
-        if parquet_files.is_empty() {
+        if valid_partitions.is_empty() {
             return Ok(vec![]);
         }
 
         // Create a temporary session for this query
         let ctx = self.create_session_with_storage().await?;
 
-        // Register each parquet file and build union query
+        // Register partition DIRECTORIES (not individual files)
+        // DataFusion handles multiple files within each directory efficiently
         let timestamp_col = config.timestamp_col();
-        self.read_parquet_files_with_filter(&ctx, &parquet_files, timestamp_col, start, end)
+        self.read_parquet_files_with_filter(&ctx, &valid_partitions, timestamp_col, start, end)
             .await
     }
 
@@ -284,42 +285,46 @@ impl DeltaEngine {
             return Ok(vec![]);
         }
 
-        // Find all parquet files in partition directories
-        let parquet_files = find_parquet_files(&partition_paths)?;
+        // Filter to only existing directories that contain parquet files
+        let valid_partitions = filter_valid_partition_dirs(&partition_paths)?;
 
-        if parquet_files.is_empty() {
+        if valid_partitions.is_empty() {
             return Ok(vec![]);
         }
 
         let ctx = self.create_session_with_storage().await?;
 
-        self.read_parquet_files_with_filter(&ctx, &parquet_files, timestamp_col, start, end)
+        self.read_parquet_files_with_filter(&ctx, &valid_partitions, timestamp_col, start, end)
             .await
     }
 
     /// Read parquet files with timestamp filter.
+    ///
+    /// Registers partition DIRECTORIES (not individual files) as tables.
+    /// DataFusion handles multiple files within each directory efficiently.
     async fn read_parquet_files_with_filter(
         &self,
         ctx: &SessionContext,
-        files: &[String],
+        partition_dirs: &[String],
         timestamp_col: &str,
         start: &str,
         end: &str,
     ) -> Result<Vec<RecordBatch>> {
-        if files.is_empty() {
+        if partition_dirs.is_empty() {
             return Ok(vec![]);
         }
 
-        // Register each parquet file as a separate table
-        for (i, file_path) in files.iter().enumerate() {
+        // Register each partition DIRECTORY as a table
+        // DataFusion will discover and read all parquet files in each directory
+        for (i, dir_path) in partition_dirs.iter().enumerate() {
             let table_name = format!("_ts_part_{}", i);
-            ctx.register_parquet(&table_name, file_path, Default::default())
+            ctx.register_parquet(&table_name, dir_path, Default::default())
                 .await?;
         }
 
-        // Build UNION ALL query with timestamp filter
+        // Build UNION ALL query - now only N partitions (days), not N files
         let mut union_parts = Vec::new();
-        for i in 0..files.len() {
+        for i in 0..partition_dirs.len() {
             union_parts.push(format!(
                 "SELECT * FROM _ts_part_{} WHERE {} >= '{}' AND {} < '{}'",
                 i, timestamp_col, start, timestamp_col, end
@@ -683,40 +688,45 @@ fn arrow_type_to_delta(arrow_type: &arrow::datatypes::DataType) -> Result<DataTy
     Ok(delta_type)
 }
 
-/// Find all parquet files in the given partition directories.
+/// Filter partition directories to only include those that exist and contain parquet files.
 ///
-/// Handles both local filesystem paths and cloud storage paths (S3).
-fn find_parquet_files(partition_paths: &[String]) -> Result<Vec<String>> {
-    let mut parquet_files = Vec::new();
+/// Returns the directory paths (not individual files) for DataFusion to process.
+/// DataFusion's register_parquet can accept a directory and will discover all parquet files.
+fn filter_valid_partition_dirs(partition_paths: &[String]) -> Result<Vec<String>> {
+    let mut valid_dirs = Vec::new();
 
     for partition_path in partition_paths {
-        // Check if it's a local path or cloud storage
+        // Check if it's a cloud storage path
         if partition_path.starts_with("s3://")
             || partition_path.starts_with("gs://")
             || partition_path.starts_with("az://")
         {
-            // For cloud storage, we'll use the directory path and let DataFusion
-            // discover files. Return the partition path with glob pattern.
-            parquet_files.push(format!("{}/*.parquet", partition_path));
+            // For cloud storage, assume the path is valid
+            // DataFusion will handle discovery
+            valid_dirs.push(partition_path.clone());
         } else {
-            // Local filesystem - enumerate files directly
+            // Local filesystem - check if directory exists and has parquet files
             let path = Path::new(partition_path);
             if path.exists() && path.is_dir() {
-                if let Ok(entries) = std::fs::read_dir(path) {
-                    for entry in entries.flatten() {
-                        let file_path = entry.path();
-                        if file_path.extension().map_or(false, |ext| ext == "parquet") {
-                            if let Some(path_str) = file_path.to_str() {
-                                parquet_files.push(path_str.to_string());
-                            }
-                        }
-                    }
+                // Check if there's at least one parquet file
+                let has_parquet = std::fs::read_dir(path)
+                    .map(|entries| {
+                        entries.flatten().any(|e| {
+                            e.path()
+                                .extension()
+                                .map_or(false, |ext| ext == "parquet")
+                        })
+                    })
+                    .unwrap_or(false);
+
+                if has_parquet {
+                    valid_dirs.push(partition_path.clone());
                 }
             }
         }
     }
 
-    Ok(parquet_files)
+    Ok(valid_dirs)
 }
 
 /// Information about a Delta table.
