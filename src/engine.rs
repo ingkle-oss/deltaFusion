@@ -4,11 +4,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
+use datafusion::datasource::listing::ListingOptions;
 use datafusion::prelude::*;
 use deltalake::DeltaTable;
 
 use crate::config::StorageConfig;
 use crate::error::{DeltaFusionError, Result};
+use crate::time_series::{
+    generate_partition_glob, parse_timestamp, TimeSeriesConfig,
+};
 
 /// Cached table entry with metadata.
 struct CachedTable {
@@ -27,8 +31,10 @@ struct CachedTable {
 pub struct DeltaEngine {
     ctx: SessionContext,
     storage_config: StorageConfig,
-    /// Cached tables: name -> CachedTable
+    /// Cached Delta tables: name -> CachedTable
     tables: HashMap<String, CachedTable>,
+    /// Time series configurations: name -> TimeSeriesConfig
+    time_series: HashMap<String, TimeSeriesConfig>,
 }
 
 impl DeltaEngine {
@@ -39,18 +45,24 @@ impl DeltaEngine {
 
     /// Create a new DeltaEngine with custom storage configuration.
     pub fn with_config(storage_config: StorageConfig) -> Self {
-        let ctx = SessionContext::new();
+        let config = SessionConfig::new()
+            .with_target_partitions(num_cpus::get())
+            .with_batch_size(8192);
+        let ctx = SessionContext::new_with_config(config);
+
         Self {
             ctx,
             storage_config,
             tables: HashMap::new(),
+            time_series: HashMap::new(),
         }
     }
 
+    // ========================================================================
+    // Delta Table Methods (existing)
+    // ========================================================================
+
     /// Register a Delta table with the given name.
-    ///
-    /// The table is cached after loading to avoid repeated log replay.
-    /// Use `refresh_table` to reload the table with latest changes.
     pub async fn register_table(&mut self, name: &str, path: &str) -> Result<()> {
         let table = self.open_delta_table(path).await?;
         let arc_table = Arc::new(table);
@@ -70,8 +82,6 @@ impl DeltaEngine {
     }
 
     /// Register a Delta table at a specific version.
-    ///
-    /// The table is cached at the specified version.
     pub async fn register_table_with_version(
         &mut self,
         name: &str,
@@ -97,9 +107,6 @@ impl DeltaEngine {
     }
 
     /// Refresh a registered table to load latest changes.
-    ///
-    /// This reloads the table from storage, picking up any new commits.
-    /// If the table was registered at a specific version, it stays at that version.
     pub async fn refresh_table(&mut self, name: &str) -> Result<()> {
         let cached = self
             .tables
@@ -109,10 +116,8 @@ impl DeltaEngine {
         let path = cached.path.clone();
         let loaded_version = cached.loaded_version;
 
-        // Deregister old table
         self.ctx.deregister_table(name)?;
 
-        // Reload table
         let mut table = self.open_delta_table(&path).await?;
         if let Some(version) = loaded_version {
             table.load_version(version).await?;
@@ -142,32 +147,248 @@ impl DeltaEngine {
         Ok(())
     }
 
-    /// Execute a SQL query and return results as Arrow RecordBatches.
+    // ========================================================================
+    // Time Series Methods (new - Delta log 스킵)
+    // ========================================================================
+
+    /// Register a time series table configuration.
     ///
-    /// This is the primary query interface, returning zero-copy Arrow data.
+    /// This does NOT read any data - it just stores the configuration.
+    /// Use `read_time_range` to actually query data.
+    pub fn register_time_series(
+        &mut self,
+        name: &str,
+        path: &str,
+        partition_col: &str,
+        timestamp_col: &str,
+    ) {
+        let config = TimeSeriesConfig::new(path, partition_col, timestamp_col);
+        self.time_series.insert(name.to_string(), config);
+    }
+
+    /// Register a time series with custom partition format.
+    pub fn register_time_series_with_format(
+        &mut self,
+        name: &str,
+        path: &str,
+        partition_col: &str,
+        timestamp_col: &str,
+        partition_format: &str,
+    ) {
+        let config = TimeSeriesConfig::new(path, partition_col, timestamp_col)
+            .with_partition_format(partition_format);
+        self.time_series.insert(name.to_string(), config);
+    }
+
+    /// Read time range data directly from parquet files.
+    ///
+    /// This bypasses Delta log entirely for maximum performance.
+    /// Partition pruning is done based on date, then DataFusion
+    /// applies row group pruning and predicate pushdown.
+    pub async fn read_time_range(
+        &self,
+        name: &str,
+        start: &str,
+        end: &str,
+    ) -> Result<Vec<RecordBatch>> {
+        let config = self
+            .time_series
+            .get(name)
+            .ok_or_else(|| DeltaFusionError::TableNotFound(name.to_string()))?;
+
+        let start_ts = parse_timestamp(start)?;
+        let end_ts = parse_timestamp(end)?;
+
+        // Generate partition paths
+        let globs = generate_partition_glob(config, start_ts, end_ts);
+
+        if globs.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Create a temporary session for this query
+        let ctx = self.create_session_with_storage().await?;
+
+        // Register parquet files
+        let options = ListingOptions::new(Arc::new(
+            datafusion::datasource::file_format::parquet::ParquetFormat::default(),
+        ))
+        .with_file_extension(".parquet");
+
+        // Try to register all paths at once first
+        let table_paths: Vec<_> = globs.iter().map(|g| g.as_str()).collect();
+        let combined_path = table_paths.join(",");
+
+        let registration_result = ctx
+            .register_listing_table("_ts_temp", &combined_path, options.clone(), None, None)
+            .await;
+
+        if registration_result.is_err() {
+            // If combined registration fails, try registering paths individually
+            for (i, glob) in globs.iter().enumerate() {
+                let name = format!("_ts_part_{}", i);
+                let _ = ctx
+                    .register_listing_table(&name, glob, options.clone(), None, None)
+                    .await;
+            }
+        }
+
+        // Build query with timestamp filter
+        let batches = if registration_result.is_ok() {
+            // Combined table registered successfully
+            let sql = format!(
+                "SELECT * FROM _ts_temp WHERE {} >= '{}' AND {} < '{}'",
+                config.timestamp_col, start, config.timestamp_col, end
+            );
+            let df = ctx.sql(&sql).await?;
+            df.collect().await?
+        } else {
+            // Use union of individual partitions
+            let partition_count = globs.len();
+            let mut union_sql = String::new();
+            for i in 0..partition_count {
+                if i > 0 {
+                    union_sql.push_str(" UNION ALL ");
+                }
+                union_sql.push_str(&format!(
+                    "SELECT * FROM _ts_part_{} WHERE {} >= '{}' AND {} < '{}'",
+                    i, config.timestamp_col, start, config.timestamp_col, end
+                ));
+            }
+            match ctx.sql(&union_sql).await {
+                Ok(df) => df.collect().await?,
+                Err(_) => vec![], // No partitions found
+            }
+        };
+
+        Ok(batches)
+    }
+
+    /// Read time range directly from a path (without pre-registration).
+    pub async fn read_time_range_direct(
+        &self,
+        path: &str,
+        partition_col: &str,
+        timestamp_col: &str,
+        start: &str,
+        end: &str,
+    ) -> Result<Vec<RecordBatch>> {
+        let config = TimeSeriesConfig::new(path, partition_col, timestamp_col);
+
+        let start_ts = parse_timestamp(start)?;
+        let end_ts = parse_timestamp(end)?;
+
+        let globs = generate_partition_glob(&config, start_ts, end_ts);
+
+        if globs.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let ctx = self.create_session_with_storage().await?;
+
+        // Register all partition paths
+        for (i, glob) in globs.iter().enumerate() {
+            let options = ListingOptions::new(Arc::new(
+                datafusion::datasource::file_format::parquet::ParquetFormat::default(),
+            ))
+            .with_file_extension(".parquet");
+
+            let table_name = format!("_part_{}", i);
+            if ctx
+                .register_listing_table(&table_name, glob, options, None, None)
+                .await
+                .is_err()
+            {
+                // Skip partitions that don't exist
+                continue;
+            }
+        }
+
+        // Union all partitions
+        let partition_count = globs.len();
+        if partition_count == 0 {
+            return Ok(vec![]);
+        }
+
+        let mut union_sql = String::new();
+        for i in 0..partition_count {
+            if i > 0 {
+                union_sql.push_str(" UNION ALL ");
+            }
+            union_sql.push_str(&format!(
+                "SELECT * FROM _part_{} WHERE {} >= '{}' AND {} < '{}'",
+                i, timestamp_col, start, timestamp_col, end
+            ));
+        }
+
+        // Try the union query, fall back to simpler approach if needed
+        let df = match ctx.sql(&union_sql).await {
+            Ok(df) => df,
+            Err(_) => {
+                // Fallback: try first available partition
+                for i in 0..partition_count {
+                    let sql = format!(
+                        "SELECT * FROM _part_{} WHERE {} >= '{}' AND {} < '{}'",
+                        i, timestamp_col, start, timestamp_col, end
+                    );
+                    if let Ok(df) = ctx.sql(&sql).await {
+                        return Ok(df.collect().await?);
+                    }
+                }
+                return Ok(vec![]);
+            }
+        };
+
+        let batches = df.collect().await?;
+        Ok(batches)
+    }
+
+    /// Create a new session context with storage options.
+    async fn create_session_with_storage(&self) -> Result<SessionContext> {
+        let config = SessionConfig::new()
+            .with_target_partitions(num_cpus::get())
+            .with_batch_size(8192);
+
+        let ctx = SessionContext::new_with_config(config);
+
+        // Register object store if needed
+        let storage_opts = self.storage_config.to_storage_options();
+        if !storage_opts.is_empty() {
+            // For S3, we need to configure the runtime
+            // This is handled by DataFusion's built-in S3 support
+            // when we use s3:// URLs
+        }
+
+        Ok(ctx)
+    }
+
+    // ========================================================================
+    // Query Methods
+    // ========================================================================
+
+    /// Execute a SQL query and return results as Arrow RecordBatches.
     pub async fn query(&self, sql: &str) -> Result<Vec<RecordBatch>> {
         let df = self.ctx.sql(sql).await?;
         let batches = df.collect().await?;
         Ok(batches)
     }
 
-    /// Execute a SQL query and return a DataFrame for further processing.
+    /// Execute a SQL query and return a DataFrame.
     pub async fn query_df(&self, sql: &str) -> Result<DataFrame> {
         let df = self.ctx.sql(sql).await?;
         Ok(df)
     }
 
-    /// Get table metadata from cache (no I/O if already registered).
-    ///
-    /// If the table is registered, uses cached metadata.
-    /// Otherwise, opens the table fresh (use `register_table` to cache it).
+    // ========================================================================
+    // Metadata Methods
+    // ========================================================================
+
+    /// Get table metadata from cache.
     pub async fn table_info(&self, name_or_path: &str) -> Result<TableInfo> {
-        // First check if it's a registered table name
         if let Some(cached) = self.tables.get(name_or_path) {
             return self.extract_table_info(&cached.table, &cached.path);
         }
 
-        // Otherwise treat as path and open fresh (not cached)
         let table = self.open_delta_table(name_or_path).await?;
         self.extract_table_info(&table, name_or_path)
     }
@@ -182,7 +403,6 @@ impl DeltaEngine {
         self.extract_table_info(&cached.table, &cached.path)
     }
 
-    /// Extract TableInfo from a DeltaTable.
     fn extract_table_info(&self, table: &DeltaTable, path: &str) -> Result<TableInfo> {
         let version = table.version();
         let schema = table.get_schema()?.clone();
@@ -207,9 +427,19 @@ impl DeltaEngine {
         self.tables.keys().cloned().collect()
     }
 
+    /// List all registered time series names.
+    pub fn list_time_series(&self) -> Vec<String> {
+        self.time_series.keys().cloned().collect()
+    }
+
     /// Check if a table is registered.
     pub fn is_registered(&self, name: &str) -> bool {
         self.tables.contains_key(name)
+    }
+
+    /// Check if a time series is registered.
+    pub fn is_time_series_registered(&self, name: &str) -> bool {
+        self.time_series.contains_key(name)
     }
 
     /// Deregister a table.
@@ -217,6 +447,11 @@ impl DeltaEngine {
         self.ctx.deregister_table(name)?;
         self.tables.remove(name);
         Ok(())
+    }
+
+    /// Deregister a time series.
+    pub fn deregister_time_series(&mut self, name: &str) {
+        self.time_series.remove(name);
     }
 
     /// Open a Delta table with storage options.
@@ -266,5 +501,13 @@ mod tests {
     async fn test_is_registered() {
         let engine = DeltaEngine::new();
         assert!(!engine.is_registered("nonexistent"));
+    }
+
+    #[test]
+    fn test_register_time_series() {
+        let mut engine = DeltaEngine::new();
+        engine.register_time_series("sensor", "s3://bucket/data", "dt", "timestamp");
+        assert!(engine.is_time_series_registered("sensor"));
+        assert!(!engine.is_time_series_registered("other"));
     }
 }

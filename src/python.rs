@@ -5,6 +5,7 @@
 //! - Arrow data is transferred via zero-copy when possible
 //! - Errors are converted to Python exceptions
 //! - Tables are cached to avoid repeated log replay
+//! - Time series API bypasses Delta log for fast partition-based access
 
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
@@ -20,10 +21,6 @@ use crate::engine::DeltaEngine;
 use crate::error::DeltaFusionError;
 
 /// Python wrapper for DeltaEngine.
-///
-/// Provides SQL query capabilities over Delta Lake tables with zero-copy
-/// Arrow data transfer to Python. Tables are cached after registration
-/// to avoid repeated log replay overhead.
 #[pyclass]
 pub struct PyDeltaEngine {
     engine: Arc<tokio::sync::Mutex<DeltaEngine>>,
@@ -33,11 +30,6 @@ pub struct PyDeltaEngine {
 #[pymethods]
 impl PyDeltaEngine {
     /// Create a new DeltaEngine.
-    ///
-    /// Configuration is loaded from environment variables:
-    /// - AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY: S3 credentials
-    /// - AWS_REGION: S3 region
-    /// - AWS_ENDPOINT_URL: Custom S3 endpoint (for MinIO, etc.)
     #[new]
     #[pyo3(signature = (storage_options=None))]
     fn new(storage_options: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
@@ -77,15 +69,11 @@ impl PyDeltaEngine {
         })
     }
 
+    // ========================================================================
+    // Delta Table Methods
+    // ========================================================================
+
     /// Register a Delta table for querying.
-    ///
-    /// The table is cached after loading to avoid repeated log replay.
-    /// Use `refresh_table()` to reload with latest changes.
-    ///
-    /// Args:
-    ///     name: The name to use in SQL queries
-    ///     path: Path to the Delta table (local or s3://)
-    ///     version: Optional specific version to load
     #[pyo3(signature = (name, path, version=None))]
     fn register_table(
         &self,
@@ -97,7 +85,6 @@ impl PyDeltaEngine {
         let engine = Arc::clone(&self.engine);
         let runtime = Arc::clone(&self.runtime);
 
-        // Release GIL during async operation
         py.allow_threads(|| {
             runtime.block_on(async {
                 let mut engine = engine.lock().await;
@@ -113,12 +100,6 @@ impl PyDeltaEngine {
     }
 
     /// Refresh a registered table to load latest changes.
-    ///
-    /// This reloads the table from storage, picking up any new commits.
-    /// Useful when the underlying Delta table has been modified.
-    ///
-    /// Args:
-    ///     name: The registered table name to refresh
     fn refresh_table(&self, py: Python<'_>, name: String) -> PyResult<()> {
         let engine = Arc::clone(&self.engine);
         let runtime = Arc::clone(&self.runtime);
@@ -134,8 +115,6 @@ impl PyDeltaEngine {
     }
 
     /// Refresh all registered tables.
-    ///
-    /// Reloads all tables from storage to pick up latest changes.
     fn refresh_all(&self, py: Python<'_>) -> PyResult<()> {
         let engine = Arc::clone(&self.engine);
         let runtime = Arc::clone(&self.runtime);
@@ -151,9 +130,6 @@ impl PyDeltaEngine {
     }
 
     /// Deregister a table.
-    ///
-    /// Args:
-    ///     name: The table name to deregister
     fn deregister_table(&self, py: Python<'_>, name: String) -> PyResult<()> {
         let engine = Arc::clone(&self.engine);
         let runtime = Arc::clone(&self.runtime);
@@ -168,20 +144,146 @@ impl PyDeltaEngine {
         Ok(())
     }
 
-    /// Execute a SQL query and return results as PyArrow RecordBatches.
+    // ========================================================================
+    // Time Series Methods (Delta log bypass)
+    // ========================================================================
+
+    /// Register a time series table configuration.
     ///
-    /// This uses zero-copy transfer when possible for maximum performance.
+    /// This does NOT read any data - it just stores the configuration.
+    /// Use `read_time_range` to actually query data.
     ///
     /// Args:
-    ///     sql: SQL query string
+    ///     name: Name for the time series
+    ///     path: Base path to the data (e.g., "s3://bucket/sensor_data")
+    ///     partition_col: Partition column name (e.g., "dt")
+    ///     timestamp_col: Timestamp column name in parquet files
+    ///     partition_format: Optional partition date format (default: "%Y-%m-%d")
+    #[pyo3(signature = (name, path, partition_col, timestamp_col, partition_format=None))]
+    fn register_time_series(
+        &self,
+        py: Python<'_>,
+        name: String,
+        path: String,
+        partition_col: String,
+        timestamp_col: String,
+        partition_format: Option<String>,
+    ) -> PyResult<()> {
+        let engine = Arc::clone(&self.engine);
+        let runtime = Arc::clone(&self.runtime);
+
+        py.allow_threads(|| {
+            runtime.block_on(async {
+                let mut engine = engine.lock().await;
+                if let Some(fmt) = partition_format {
+                    engine.register_time_series_with_format(
+                        &name,
+                        &path,
+                        &partition_col,
+                        &timestamp_col,
+                        &fmt,
+                    );
+                } else {
+                    engine.register_time_series(&name, &path, &partition_col, &timestamp_col);
+                }
+                Ok::<(), DeltaFusionError>(())
+            })
+        })?;
+
+        Ok(())
+    }
+
+    /// Read time range data directly from parquet files.
+    ///
+    /// This bypasses Delta log entirely for maximum performance.
+    ///
+    /// Args:
+    ///     name: Registered time series name
+    ///     start: Start timestamp (ISO 8601 format)
+    ///     end: End timestamp (ISO 8601 format)
     ///
     /// Returns:
     ///     List of PyArrow RecordBatches
+    fn read_time_range(
+        &self,
+        py: Python<'_>,
+        name: String,
+        start: String,
+        end: String,
+    ) -> PyResult<Vec<PyObject>> {
+        let engine = Arc::clone(&self.engine);
+        let runtime = Arc::clone(&self.runtime);
+
+        let batches: Vec<RecordBatch> = py.allow_threads(|| {
+            runtime.block_on(async {
+                let engine = engine.lock().await;
+                engine.read_time_range(&name, &start, &end).await
+            })
+        })?;
+
+        batches.into_iter().map(|batch| batch.to_pyarrow(py)).collect()
+    }
+
+    /// Read time range directly from a path (without pre-registration).
+    ///
+    /// Args:
+    ///     path: Base path to the data
+    ///     partition_col: Partition column name (e.g., "dt")
+    ///     timestamp_col: Timestamp column name in parquet files
+    ///     start: Start timestamp (ISO 8601 format)
+    ///     end: End timestamp (ISO 8601 format)
+    ///
+    /// Returns:
+    ///     List of PyArrow RecordBatches
+    fn read_time_range_direct(
+        &self,
+        py: Python<'_>,
+        path: String,
+        partition_col: String,
+        timestamp_col: String,
+        start: String,
+        end: String,
+    ) -> PyResult<Vec<PyObject>> {
+        let engine = Arc::clone(&self.engine);
+        let runtime = Arc::clone(&self.runtime);
+
+        let batches: Vec<RecordBatch> = py.allow_threads(|| {
+            runtime.block_on(async {
+                let engine = engine.lock().await;
+                engine
+                    .read_time_range_direct(&path, &partition_col, &timestamp_col, &start, &end)
+                    .await
+            })
+        })?;
+
+        batches.into_iter().map(|batch| batch.to_pyarrow(py)).collect()
+    }
+
+    /// Deregister a time series.
+    fn deregister_time_series(&self, py: Python<'_>, name: String) -> PyResult<()> {
+        let engine = Arc::clone(&self.engine);
+        let runtime = Arc::clone(&self.runtime);
+
+        py.allow_threads(|| {
+            runtime.block_on(async {
+                let mut engine = engine.lock().await;
+                engine.deregister_time_series(&name);
+                Ok::<(), DeltaFusionError>(())
+            })
+        })?;
+
+        Ok(())
+    }
+
+    // ========================================================================
+    // Query Methods
+    // ========================================================================
+
+    /// Execute a SQL query and return results as PyArrow RecordBatches.
     fn query(&self, py: Python<'_>, sql: String) -> PyResult<Vec<PyObject>> {
         let engine = Arc::clone(&self.engine);
         let runtime = Arc::clone(&self.runtime);
 
-        // Release GIL during query execution
         let batches: Vec<RecordBatch> = py.allow_threads(|| {
             runtime.block_on(async {
                 let engine = engine.lock().await;
@@ -189,30 +291,16 @@ impl PyDeltaEngine {
             })
         })?;
 
-        // Convert to PyArrow RecordBatches via zero-copy
-        let py_batches: PyResult<Vec<PyObject>> = batches
-            .into_iter()
-            .map(|batch| batch.to_pyarrow(py))
-            .collect();
-
-        py_batches
+        batches.into_iter().map(|batch| batch.to_pyarrow(py)).collect()
     }
 
     /// Execute a SQL query and return results as a list of dictionaries.
     ///
     /// WARNING: This method copies data row-by-row and is slow for large datasets.
-    /// For large data, prefer `query()` with PyArrow for better performance.
-    ///
-    /// Args:
-    ///     sql: SQL query string
-    ///
-    /// Returns:
-    ///     List of row dictionaries
     fn query_to_dicts(&self, py: Python<'_>, sql: String) -> PyResult<Py<PyList>> {
         let engine = Arc::clone(&self.engine);
         let runtime = Arc::clone(&self.runtime);
 
-        // Release GIL during query execution
         let batches: Vec<RecordBatch> = py.allow_threads(|| {
             runtime.block_on(async {
                 let engine = engine.lock().await;
@@ -220,7 +308,6 @@ impl PyDeltaEngine {
             })
         })?;
 
-        // Convert to Python list of dicts (slow for large data!)
         let result = PyList::empty_bound(py);
         for batch in batches {
             let schema = batch.schema();
@@ -238,16 +325,11 @@ impl PyDeltaEngine {
         Ok(result.into())
     }
 
+    // ========================================================================
+    // Metadata Methods
+    // ========================================================================
+
     /// Get information about a Delta table.
-    ///
-    /// If the name matches a registered table, uses cached metadata (no I/O).
-    /// Otherwise, opens the table fresh from the path.
-    ///
-    /// Args:
-    ///     name_or_path: Registered table name or path to Delta table
-    ///
-    /// Returns:
-    ///     Dictionary with path, version, schema, num_files, partition_columns
     fn table_info(&self, py: Python<'_>, name_or_path: String) -> PyResult<Py<PyDict>> {
         let engine = Arc::clone(&self.engine);
         let runtime = Arc::clone(&self.runtime);
@@ -282,13 +364,20 @@ impl PyDeltaEngine {
         })
     }
 
+    /// List all registered time series names.
+    fn list_time_series(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+        let engine = Arc::clone(&self.engine);
+        let runtime = Arc::clone(&self.runtime);
+
+        py.allow_threads(|| {
+            runtime.block_on(async {
+                let engine = engine.lock().await;
+                Ok(engine.list_time_series())
+            })
+        })
+    }
+
     /// Check if a table is registered.
-    ///
-    /// Args:
-    ///     name: Table name to check
-    ///
-    /// Returns:
-    ///     True if the table is registered
     fn is_registered(&self, py: Python<'_>, name: String) -> PyResult<bool> {
         let engine = Arc::clone(&self.engine);
         let runtime = Arc::clone(&self.runtime);
@@ -297,6 +386,19 @@ impl PyDeltaEngine {
             runtime.block_on(async {
                 let engine = engine.lock().await;
                 Ok(engine.is_registered(&name))
+            })
+        })
+    }
+
+    /// Check if a time series is registered.
+    fn is_time_series_registered(&self, py: Python<'_>, name: String) -> PyResult<bool> {
+        let engine = Arc::clone(&self.engine);
+        let runtime = Arc::clone(&self.runtime);
+
+        py.allow_threads(|| {
+            runtime.block_on(async {
+                let engine = engine.lock().await;
+                Ok(engine.is_time_series_registered(&name))
             })
         })
     }

@@ -22,6 +22,7 @@
 pub mod config;
 pub mod engine;
 pub mod error;
+pub mod time_series;
 
 #[cfg(feature = "python")]
 mod python;
