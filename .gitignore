@@ -15,6 +15,7 @@ dist/
 *.egg
 .venv/
 venv/
+.pytest_cache/
 
 # IDE
 .idea/

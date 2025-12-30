@@ -102,6 +102,7 @@ pub fn generate_partition_glob(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Timelike;
 
     #[test]
     fn test_parse_timestamp() {

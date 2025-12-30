@@ -35,7 +35,7 @@ python-source = "python"
 module-name = "delta_fusion._core"
 
 [tool.pytest.ini_options]
-testpaths = ["python/tests"]
+testpaths = ["tests/python"]
 python_files = ["test_*.py"]
 
 [tool.ruff]
