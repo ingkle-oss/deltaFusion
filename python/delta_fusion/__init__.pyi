@@ -20,18 +20,18 @@ class DeltaEngine:
         self,
         name: str,
         path: str,
-        partition_col: str,
         timestamp_col: str,
+        partition_col: str = "date",
         partition_format: str | None = None,
     ) -> None: ...
     def read_time_range(self, name: str, start: str, end: str) -> list[Any]: ...
     def read_time_range_direct(
         self,
         path: str,
-        partition_col: str,
         timestamp_col: str,
         start: str,
         end: str,
+        partition_col: str = "date",
     ) -> list[Any]: ...
     def deregister_time_series(self, name: str) -> None: ...
 

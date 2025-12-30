@@ -89,8 +89,8 @@ class DeltaEngine:
         self,
         name: str,
         path: str,
-        partition_col: str,
         timestamp_col: str,
+        partition_col: str = "date",
         partition_format: str | None = None,
     ) -> None:
         """Register a time series table configuration.
@@ -103,15 +103,14 @@ class DeltaEngine:
         Args:
             name: Name for the time series
             path: Base path to the data (e.g., "s3://bucket/sensor_data")
-            partition_col: Partition column name (e.g., "dt")
             timestamp_col: Timestamp column name in parquet files
+            partition_col: Partition column name (default: "date")
             partition_format: Partition date format (default: "%Y-%m-%d")
 
         Example:
             >>> engine.register_time_series(
             ...     "sensor",
             ...     "s3://bucket/sensor_data",
-            ...     partition_col="dt",
             ...     timestamp_col="timestamp"
             ... )
         """
@@ -148,10 +147,10 @@ class DeltaEngine:
     def read_time_range_direct(
         self,
         path: str,
-        partition_col: str,
         timestamp_col: str,
         start: str,
         end: str,
+        partition_col: str = "date",
     ) -> list:
         """Read time range directly from path (without pre-registration).
 
@@ -159,10 +158,10 @@ class DeltaEngine:
 
         Args:
             path: Base path to the data
-            partition_col: Partition column name (e.g., "dt")
             timestamp_col: Timestamp column name in parquet files
             start: Start timestamp (ISO 8601)
             end: End timestamp (ISO 8601)
+            partition_col: Partition column name (default: "date")
 
         Returns:
             List of pyarrow.RecordBatch objects
