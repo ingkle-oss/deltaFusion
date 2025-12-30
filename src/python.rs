@@ -402,6 +402,168 @@ impl PyDeltaEngine {
             })
         })
     }
+
+    // ========================================================================
+    // Write Methods
+    // ========================================================================
+
+    /// Create a new Delta table at the specified path.
+    ///
+    /// Args:
+    ///     path: Path where the table will be created
+    ///     schema: PyArrow schema for the table
+    ///     partition_columns: Optional list of partition column names
+    #[pyo3(signature = (path, schema, partition_columns=None))]
+    fn create_table(
+        &self,
+        py: Python<'_>,
+        path: String,
+        schema: PyObject,
+        partition_columns: Option<Vec<String>>,
+    ) -> PyResult<()> {
+        use arrow::pyarrow::FromPyArrow;
+
+        let arrow_schema = arrow::datatypes::Schema::from_pyarrow_bound(schema.bind(py))?;
+        let engine = Arc::clone(&self.engine);
+        let runtime = Arc::clone(&self.runtime);
+
+        py.allow_threads(|| {
+            runtime.block_on(async {
+                let engine = engine.lock().await;
+                engine.create_table(&path, &arrow_schema, partition_columns).await
+            })
+        })?;
+
+        Ok(())
+    }
+
+    /// Write RecordBatches to a Delta table.
+    ///
+    /// Args:
+    ///     path: Path to the Delta table
+    ///     data: PyArrow Table or list of RecordBatches
+    ///     mode: Write mode - "append", "overwrite", "error", or "ignore"
+    ///     partition_columns: Optional partition columns (for new tables)
+    #[pyo3(signature = (path, data, mode="append", partition_columns=None))]
+    fn write(
+        &self,
+        py: Python<'_>,
+        path: String,
+        data: PyObject,
+        mode: &str,
+        partition_columns: Option<Vec<String>>,
+    ) -> PyResult<()> {
+        use arrow::pyarrow::FromPyArrow;
+        use crate::engine::WriteMode;
+
+        let write_mode = match mode {
+            "append" => WriteMode::Append,
+            "overwrite" => WriteMode::Overwrite,
+            "error" => WriteMode::ErrorIfExists,
+            "ignore" => WriteMode::Ignore,
+            _ => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "Invalid mode: {}. Use 'append', 'overwrite', 'error', or 'ignore'",
+                    mode
+                )));
+            }
+        };
+
+        // Convert data to RecordBatches
+        let batches: Vec<RecordBatch> = {
+            // Check if it's a PyArrow Table by checking for to_batches method
+            let data_bound = data.bind(py);
+            if data_bound.hasattr("to_batches")? {
+                // It's a Table - convert to batches
+                let batch_list = data_bound.call_method0("to_batches")?;
+                let batch_vec = batch_list.extract::<Vec<PyObject>>()?;
+                batch_vec
+                    .into_iter()
+                    .map(|obj| RecordBatch::from_pyarrow_bound(obj.bind(py)))
+                    .collect::<Result<Vec<_>, _>>()?
+            } else if let Ok(list) = data.extract::<Vec<PyObject>>(py) {
+                // It's a list of RecordBatches
+                list.into_iter()
+                    .map(|obj| RecordBatch::from_pyarrow_bound(obj.bind(py)))
+                    .collect::<Result<Vec<_>, _>>()?
+            } else {
+                // Try as a single RecordBatch
+                vec![RecordBatch::from_pyarrow_bound(data_bound)?]
+            }
+        };
+
+        let engine = Arc::clone(&self.engine);
+        let runtime = Arc::clone(&self.runtime);
+
+        py.allow_threads(|| {
+            runtime.block_on(async {
+                let engine = engine.lock().await;
+                engine.write(&path, batches, write_mode, partition_columns).await
+            })
+        })?;
+
+        Ok(())
+    }
+
+    /// Write data to a registered table by name.
+    ///
+    /// Args:
+    ///     name: Registered table name
+    ///     data: PyArrow Table or list of RecordBatches
+    ///     mode: Write mode - "append" or "overwrite"
+    #[pyo3(signature = (name, data, mode="append"))]
+    fn write_to_table(
+        &self,
+        py: Python<'_>,
+        name: String,
+        data: PyObject,
+        mode: &str,
+    ) -> PyResult<()> {
+        use arrow::pyarrow::FromPyArrow;
+        use crate::engine::WriteMode;
+
+        let write_mode = match mode {
+            "append" => WriteMode::Append,
+            "overwrite" => WriteMode::Overwrite,
+            _ => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "Invalid mode: {}. Use 'append' or 'overwrite'",
+                    mode
+                )));
+            }
+        };
+
+        // Convert data to RecordBatches
+        let batches: Vec<RecordBatch> = {
+            let data_bound = data.bind(py);
+            if data_bound.hasattr("to_batches")? {
+                let batch_list = data_bound.call_method0("to_batches")?;
+                let batch_vec = batch_list.extract::<Vec<PyObject>>()?;
+                batch_vec
+                    .into_iter()
+                    .map(|obj| RecordBatch::from_pyarrow_bound(obj.bind(py)))
+                    .collect::<Result<Vec<_>, _>>()?
+            } else if let Ok(list) = data.extract::<Vec<PyObject>>(py) {
+                list.into_iter()
+                    .map(|obj| RecordBatch::from_pyarrow_bound(obj.bind(py)))
+                    .collect::<Result<Vec<_>, _>>()?
+            } else {
+                vec![RecordBatch::from_pyarrow_bound(data_bound)?]
+            }
+        };
+
+        let engine = Arc::clone(&self.engine);
+        let runtime = Arc::clone(&self.runtime);
+
+        py.allow_threads(|| {
+            runtime.block_on(async {
+                let mut engine = engine.lock().await;
+                engine.write_to_table(&name, batches, write_mode).await
+            })
+        })?;
+
+        Ok(())
+    }
 }
 
 /// Convert an Arrow array value at a specific index to a Python object.

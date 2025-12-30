@@ -221,3 +221,84 @@ class DeltaEngine:
     def is_time_series_registered(self, name: str) -> bool:
         """Check if a time series is registered."""
         return self._engine.is_time_series_registered(name)
+
+    # ========================================================================
+    # Write Methods
+    # ========================================================================
+
+    def create_table(
+        self,
+        path: str,
+        schema: "pa.Schema",
+        partition_columns: list[str] | None = None,
+    ) -> None:
+        """Create a new Delta table at the specified path.
+
+        Args:
+            path: Path where the table will be created (local or s3://)
+            schema: PyArrow schema defining the table structure
+            partition_columns: Optional list of column names to partition by
+
+        Example:
+            >>> import pyarrow as pa
+            >>> schema = pa.schema([
+            ...     ("id", pa.int64()),
+            ...     ("name", pa.string()),
+            ...     ("value", pa.float64()),
+            ... ])
+            >>> engine.create_table("/path/to/table", schema)
+        """
+        self._engine.create_table(path, schema, partition_columns)
+
+    def write(
+        self,
+        path: str,
+        data: "pa.Table | list[pa.RecordBatch]",
+        mode: str = "append",
+        partition_columns: list[str] | None = None,
+    ) -> None:
+        """Write data to a Delta table.
+
+        Creates the table if it doesn't exist. For existing tables,
+        schema must be compatible.
+
+        Args:
+            path: Path to the Delta table
+            data: PyArrow Table or list of RecordBatches to write
+            mode: Write mode:
+                - "append": Add data to existing table (default)
+                - "overwrite": Replace all existing data
+                - "error": Fail if table exists
+                - "ignore": Do nothing if table exists
+            partition_columns: Partition columns (only for new tables)
+
+        Example:
+            >>> import pyarrow as pa
+            >>> table = pa.table({"id": [1, 2], "name": ["a", "b"]})
+            >>> engine.write("/path/to/table", table)
+            >>> engine.write("/path/to/table", table, mode="overwrite")
+        """
+        self._engine.write(path, data, mode, partition_columns)
+
+    def write_to_table(
+        self,
+        name: str,
+        data: "pa.Table | list[pa.RecordBatch]",
+        mode: str = "append",
+    ) -> None:
+        """Write data to a registered table.
+
+        The table must be registered first using register_table().
+        After writing, the table cache is automatically refreshed.
+
+        Args:
+            name: Registered table name
+            data: PyArrow Table or list of RecordBatches to write
+            mode: Write mode ("append" or "overwrite")
+
+        Example:
+            >>> engine.register_table("users", "/path/to/users")
+            >>> table = pa.table({"id": [3], "name": ["c"]})
+            >>> engine.write_to_table("users", table)
+        """
+        self._engine.write_to_table(name, data, mode)

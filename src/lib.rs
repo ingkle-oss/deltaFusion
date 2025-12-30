@@ -28,7 +28,7 @@ pub mod time_series;
 mod python;
 
 pub use config::StorageConfig;
-pub use engine::{DeltaEngine, TableInfo};
+pub use engine::{DeltaEngine, TableInfo, WriteMode};
 pub use error::{DeltaFusionError, Result};
 
 // Re-export PyO3 module for maturin

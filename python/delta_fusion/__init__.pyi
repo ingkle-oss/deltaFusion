@@ -45,3 +45,24 @@ class DeltaEngine:
     def list_time_series(self) -> list[str]: ...
     def is_registered(self, name: str) -> bool: ...
     def is_time_series_registered(self, name: str) -> bool: ...
+
+    # Write Methods
+    def create_table(
+        self,
+        path: str,
+        schema: Any,
+        partition_columns: list[str] | None = None,
+    ) -> None: ...
+    def write(
+        self,
+        path: str,
+        data: Any,
+        mode: str = "append",
+        partition_columns: list[str] | None = None,
+    ) -> None: ...
+    def write_to_table(
+        self,
+        name: str,
+        data: Any,
+        mode: str = "append",
+    ) -> None: ...

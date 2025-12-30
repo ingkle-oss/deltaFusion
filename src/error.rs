@@ -31,6 +31,15 @@ pub enum DeltaFusionError {
 
     #[error("Runtime error: {0}")]
     Runtime(String),
+
+    #[error("Write error: {0}")]
+    Write(String),
+
+    #[error("Schema error: {0}")]
+    Schema(String),
+
+    #[error("Table already exists: {0}")]
+    TableExists(String),
 }
 
 pub type Result<T> = std::result::Result<T, DeltaFusionError>;

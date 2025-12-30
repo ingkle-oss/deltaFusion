@@ -3,16 +3,31 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use arrow::datatypes::Schema as ArrowSchema;
 use arrow::record_batch::RecordBatch;
 use datafusion::datasource::listing::ListingOptions;
 use datafusion::prelude::*;
+use deltalake::kernel::{ArrayType, DataType, MapType, PrimitiveType, StructField, StructType};
+use deltalake::operations::DeltaOps;
+use deltalake::protocol::SaveMode;
 use deltalake::DeltaTable;
 
 use crate::config::StorageConfig;
 use crate::error::{DeltaFusionError, Result};
-use crate::time_series::{
-    generate_partition_glob, parse_timestamp, TimeSeriesConfig,
-};
+use crate::time_series::{generate_partition_glob, parse_timestamp, TimeSeriesConfig};
+
+/// Write mode for delta operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteMode {
+    /// Append data to the table.
+    Append,
+    /// Overwrite existing data.
+    Overwrite,
+    /// Error if table exists (for create operations).
+    ErrorIfExists,
+    /// Ignore if table exists (for create operations).
+    Ignore,
+}
 
 /// Cached table entry with metadata.
 struct CachedTable {
@@ -454,6 +469,116 @@ impl DeltaEngine {
         self.time_series.remove(name);
     }
 
+    // ========================================================================
+    // Write Methods
+    // ========================================================================
+
+    /// Create a new Delta table at the specified path.
+    ///
+    /// # Arguments
+    /// * `path` - Path where the table will be created
+    /// * `schema` - Arrow schema for the table
+    /// * `partition_columns` - Optional list of partition column names
+    ///
+    /// # Returns
+    /// The created DeltaTable
+    pub async fn create_table(
+        &self,
+        path: &str,
+        schema: &ArrowSchema,
+        partition_columns: Option<Vec<String>>,
+    ) -> Result<DeltaTable> {
+        let storage_options = self.storage_config.to_storage_options();
+
+        // Convert Arrow schema to Delta schema
+        let delta_schema = arrow_schema_to_delta(schema)?;
+
+        let mut builder = DeltaOps::try_from_uri_with_storage_options(path, storage_options)
+            .await?
+            .create()
+            .with_columns(delta_schema.fields().cloned());
+
+        if let Some(cols) = partition_columns {
+            builder = builder.with_partition_columns(cols);
+        }
+
+        let table = builder.with_save_mode(SaveMode::ErrorIfExists).await?;
+
+        Ok(table)
+    }
+
+    /// Write RecordBatches to a Delta table at the specified path.
+    ///
+    /// # Arguments
+    /// * `path` - Path to the Delta table
+    /// * `batches` - Data to write
+    /// * `mode` - Write mode (Append or Overwrite)
+    /// * `partition_columns` - Optional partition columns (only used when creating new table)
+    ///
+    /// # Returns
+    /// The updated DeltaTable
+    pub async fn write(
+        &self,
+        path: &str,
+        batches: Vec<RecordBatch>,
+        mode: WriteMode,
+        partition_columns: Option<Vec<String>>,
+    ) -> Result<DeltaTable> {
+        if batches.is_empty() {
+            return Err(DeltaFusionError::Write("No data to write".to_string()));
+        }
+
+        let storage_options = self.storage_config.to_storage_options();
+        let save_mode = match mode {
+            WriteMode::Append => SaveMode::Append,
+            WriteMode::Overwrite => SaveMode::Overwrite,
+            WriteMode::ErrorIfExists => SaveMode::ErrorIfExists,
+            WriteMode::Ignore => SaveMode::Ignore,
+        };
+
+        let mut builder = DeltaOps::try_from_uri_with_storage_options(path, storage_options)
+            .await?
+            .write(batches)
+            .with_save_mode(save_mode);
+
+        if let Some(cols) = partition_columns {
+            builder = builder.with_partition_columns(cols);
+        }
+
+        let table = builder.await?;
+        Ok(table)
+    }
+
+    /// Write to a registered table by name.
+    ///
+    /// # Arguments
+    /// * `name` - Registered table name
+    /// * `batches` - Data to write
+    /// * `mode` - Write mode (Append or Overwrite)
+    pub async fn write_to_table(
+        &mut self,
+        name: &str,
+        batches: Vec<RecordBatch>,
+        mode: WriteMode,
+    ) -> Result<()> {
+        let cached = self
+            .tables
+            .get(name)
+            .ok_or_else(|| DeltaFusionError::TableNotFound(name.to_string()))?;
+
+        let path = cached.path.clone();
+        let _ = self.write(&path, batches, mode, None).await?;
+
+        // Refresh the table cache after write
+        self.refresh_table(name).await?;
+
+        Ok(())
+    }
+
+    // ========================================================================
+    // Helper Methods
+    // ========================================================================
+
     /// Open a Delta table with storage options.
     async fn open_delta_table(&self, path: &str) -> Result<DeltaTable> {
         let storage_options = self.storage_config.to_storage_options();
@@ -475,6 +600,112 @@ impl Default for DeltaEngine {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Convert Arrow schema to Delta schema.
+fn arrow_schema_to_delta(schema: &ArrowSchema) -> Result<StructType> {
+    let fields: Vec<StructField> = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let delta_type = arrow_type_to_delta(field.data_type())?;
+            Ok(StructField::new(
+                field.name().clone(),
+                delta_type,
+                field.is_nullable(),
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(StructType::new(fields))
+}
+
+/// Convert Arrow data type to Delta data type.
+fn arrow_type_to_delta(arrow_type: &arrow::datatypes::DataType) -> Result<DataType> {
+    use arrow::datatypes::DataType as ArrowDataType;
+    use arrow::datatypes::TimeUnit;
+
+    let delta_type = match arrow_type {
+        // Primitive types
+        ArrowDataType::Boolean => DataType::Primitive(PrimitiveType::Boolean),
+        ArrowDataType::Int8 => DataType::Primitive(PrimitiveType::Byte),
+        ArrowDataType::Int16 => DataType::Primitive(PrimitiveType::Short),
+        ArrowDataType::Int32 => DataType::Primitive(PrimitiveType::Integer),
+        ArrowDataType::Int64 => DataType::Primitive(PrimitiveType::Long),
+        ArrowDataType::UInt8 => DataType::Primitive(PrimitiveType::Byte),
+        ArrowDataType::UInt16 => DataType::Primitive(PrimitiveType::Short),
+        ArrowDataType::UInt32 => DataType::Primitive(PrimitiveType::Integer),
+        ArrowDataType::UInt64 => DataType::Primitive(PrimitiveType::Long),
+        ArrowDataType::Float32 => DataType::Primitive(PrimitiveType::Float),
+        ArrowDataType::Float64 => DataType::Primitive(PrimitiveType::Double),
+        ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 => {
+            DataType::Primitive(PrimitiveType::String)
+        }
+        ArrowDataType::Binary | ArrowDataType::LargeBinary => {
+            DataType::Primitive(PrimitiveType::Binary)
+        }
+        ArrowDataType::Date32 | ArrowDataType::Date64 => {
+            DataType::Primitive(PrimitiveType::Date)
+        }
+        ArrowDataType::Timestamp(TimeUnit::Microsecond, tz) => {
+            if tz.is_some() {
+                DataType::Primitive(PrimitiveType::TimestampNtz)
+            } else {
+                DataType::Primitive(PrimitiveType::TimestampNtz)
+            }
+        }
+        ArrowDataType::Timestamp(_, _) => DataType::Primitive(PrimitiveType::TimestampNtz),
+        ArrowDataType::Decimal128(precision, scale) => {
+            DataType::decimal(*precision, *scale as u8).map_err(|e| {
+                DeltaFusionError::Schema(format!("Invalid decimal: {}", e))
+            })?
+        }
+        ArrowDataType::Decimal256(precision, scale) => {
+            DataType::decimal(*precision, *scale as u8).map_err(|e| {
+                DeltaFusionError::Schema(format!("Invalid decimal: {}", e))
+            })?
+        }
+        // Complex types
+        ArrowDataType::List(field) | ArrowDataType::LargeList(field) => {
+            let element_type = arrow_type_to_delta(field.data_type())?;
+            DataType::Array(Box::new(ArrayType::new(element_type, field.is_nullable())))
+        }
+        ArrowDataType::Struct(fields) => {
+            let delta_fields: Vec<StructField> = fields
+                .iter()
+                .map(|f| {
+                    let dt = arrow_type_to_delta(f.data_type())?;
+                    Ok(StructField::new(f.name().clone(), dt, f.is_nullable()))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            DataType::Struct(Box::new(StructType::new(delta_fields)))
+        }
+        ArrowDataType::Map(field, _) => {
+            if let ArrowDataType::Struct(fields) = field.data_type() {
+                if fields.len() == 2 {
+                    let key_type = arrow_type_to_delta(fields[0].data_type())?;
+                    let value_type = arrow_type_to_delta(fields[1].data_type())?;
+                    return Ok(DataType::Map(Box::new(MapType::new(
+                        key_type,
+                        value_type,
+                        fields[1].is_nullable(),
+                    ))));
+                }
+            }
+            return Err(DeltaFusionError::Schema(format!(
+                "Unsupported map type: {:?}",
+                arrow_type
+            )));
+        }
+        _ => {
+            return Err(DeltaFusionError::Schema(format!(
+                "Unsupported Arrow type: {:?}",
+                arrow_type
+            )));
+        }
+    };
+
+    Ok(delta_type)
 }
 
 /// Information about a Delta table.
