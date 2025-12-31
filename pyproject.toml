@@ -40,10 +40,10 @@ classifiers = [
 dependencies = []
 
 [project.urls]
-Homepage = "https://github.com/ysj/delta-fusion"
-Documentation = "https://github.com/ysj/delta-fusion/tree/main/docs"
-Repository = "https://github.com/ysj/delta-fusion"
-Issues = "https://github.com/ysj/delta-fusion/issues"
+Homepage = "https://github.com/ingkle-oss/deltaFusion"
+Documentation = "https://github.com/ingkle-oss/deltaFusion/tree/main/docs"
+Repository = "https://github.com/ingkle-oss/deltaFusion"
+Issues = "https://github.com/ingkle-oss/deltaFusion/issues"
 
 [project.optional-dependencies]
 pyarrow = [
