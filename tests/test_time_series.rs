@@ -77,7 +77,7 @@ fn test_timestamp_to_iso8601() {
 #[test]
 fn test_timestamp_display() {
     let ts = Timestamp::parse("2024-01-15T10:30:45").unwrap();
-    assert_eq!(format!("{}", ts), "2024-01-15T10:30:45");
+    assert_eq!(format!("{ts}"), "2024-01-15T10:30:45");
 }
 
 #[test]
@@ -250,7 +250,7 @@ async fn test_read_time_range_with_parquet_files() {
         }
         Err(e) => {
             // Expected in some environments where glob doesn't work as expected
-            println!("Read failed (may be expected): {:?}", e);
+            println!("Read failed (may be expected): {e:?}");
         }
     }
 }

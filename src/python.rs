@@ -7,6 +7,11 @@
 //! - Tables are cached to avoid repeated log replay
 //! - Time series API bypasses Delta log for fast partition-based access
 
+// Allow useless_conversion warning for this module.
+// PyO3's #[pymethods] macro makes clippy incorrectly flag DeltaFusionError -> PyErr conversions
+// as "useless" even though they're required for the error type conversion.
+#![allow(clippy::useless_conversion)]
+
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 use pyo3::ToPyObject;
@@ -109,14 +114,12 @@ fn pyarrow_to_batches(py: Python<'_>, data: &PyObject) -> PyResult<Vec<RecordBat
         batch_vec
             .into_iter()
             .map(|obj| RecordBatch::from_pyarrow_bound(obj.bind(py)))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(Into::into)
+            .collect()
     } else if let Ok(list) = data.extract::<Vec<PyObject>>(py) {
         // It's a list of RecordBatches
         list.into_iter()
             .map(|obj| RecordBatch::from_pyarrow_bound(obj.bind(py)))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(Into::into)
+            .collect()
     } else {
         // Try as a single RecordBatch
         Ok(vec![RecordBatch::from_pyarrow_bound(data_bound)?])
@@ -142,19 +145,18 @@ fn batches_to_ipc_bytes(py: Python<'_>, batches: Vec<RecordBatch>) -> PyResult<P
 
     let schema = batches[0].schema();
     let mut buffer: Vec<u8> = Vec::new();
-    let mut writer = FileWriter::try_new(&mut buffer, &schema).map_err(|e| {
-        pyo3::exceptions::PyRuntimeError::new_err(format!("IPC writer error: {}", e))
-    })?;
+    let mut writer = FileWriter::try_new(&mut buffer, &schema)
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("IPC writer error: {e}")))?;
 
     for batch in batches {
         writer.write(&batch).map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("IPC write error: {}", e))
+            pyo3::exceptions::PyRuntimeError::new_err(format!("IPC write error: {e}"))
         })?;
     }
 
-    writer.finish().map_err(|e| {
-        pyo3::exceptions::PyRuntimeError::new_err(format!("IPC finish error: {}", e))
-    })?;
+    writer
+        .finish()
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("IPC finish error: {e}")))?;
 
     Ok(PyBytes::new_bound(py, &buffer).unbind())
 }
@@ -173,8 +175,7 @@ fn parse_write_mode(mode: &str, allow_error_ignore: bool) -> PyResult<WriteMode>
                 "'append' or 'overwrite'"
             };
             Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "Invalid mode: {}. Use {}",
-                mode, valid_modes
+                "Invalid mode: {mode}. Use {valid_modes}"
             )))
         }
     }
@@ -201,7 +202,7 @@ impl PyDeltaEngine {
         let storage_config = parse_storage_options(storage_options)?;
 
         let runtime = Runtime::new().map_err(|e| {
-            DeltaFusionError::Runtime(format!("Failed to create Tokio runtime: {}", e))
+            DeltaFusionError::Runtime(format!("Failed to create Tokio runtime: {e}"))
         })?;
 
         let engine = DeltaEngine::with_config(storage_config);

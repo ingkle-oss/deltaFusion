@@ -70,7 +70,7 @@ fn test_storage_config_to_options() {
     let opts = config.to_storage_options();
     assert_eq!(opts.get("AWS_ACCESS_KEY_ID"), Some(&"key".to_string()));
     assert_eq!(opts.get("AWS_REGION"), Some(&"us-east-1".to_string()));
-    assert!(opts.get("AWS_SECRET_ACCESS_KEY").is_none());
+    assert!(!opts.contains_key("AWS_SECRET_ACCESS_KEY"));
 }
 
 // =============================================================================
@@ -113,7 +113,7 @@ async fn test_register_table_with_delta() {
         }
         Err(e) => {
             // May fail if delta log format is not exactly right
-            println!("Registration failed (expected in minimal test): {:?}", e);
+            println!("Registration failed (expected in minimal test): {e:?}");
         }
     }
 }

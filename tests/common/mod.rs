@@ -1,5 +1,7 @@
 //! Common test utilities for integration tests.
 
+#![allow(dead_code)]
+
 use arrow::array::{Float64Array, Int64Array, StringArray, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
@@ -18,7 +20,7 @@ pub fn create_test_parquet(
     values: Vec<f64>,
 ) -> std::io::Result<()> {
     // Create partition directory
-    let partition_dir = path.join(format!("{}={}", partition_col, partition_value));
+    let partition_dir = path.join(format!("{partition_col}={partition_value}"));
     fs::create_dir_all(&partition_dir)?;
 
     let file_path = partition_dir.join("data.parquet");
@@ -130,7 +132,7 @@ pub fn create_test_delta_table(path: &Path, data: Vec<(&str, Vec<i64>)>) -> std:
     });
     let add_line = serde_json::to_string(&add_entry).unwrap();
 
-    let log_content = format!("{}\n{}\n{}\n", protocol_line, meta_line, add_line);
+    let log_content = format!("{protocol_line}\n{meta_line}\n{add_line}\n");
     fs::write(delta_log.join("00000000000000000000.json"), log_content)?;
 
     Ok(())
@@ -140,7 +142,7 @@ pub fn create_test_delta_table(path: &Path, data: Vec<(&str, Vec<i64>)>) -> std:
 pub fn generate_timestamps(date: &str, count: usize, interval_secs: i64) -> Vec<i64> {
     use chrono::NaiveDateTime;
 
-    let base = NaiveDateTime::parse_from_str(&format!("{}T00:00:00", date), "%Y-%m-%dT%H:%M:%S")
+    let base = NaiveDateTime::parse_from_str(&format!("{date}T00:00:00"), "%Y-%m-%dT%H:%M:%S")
         .expect("Invalid date");
     let base_micros = base.and_utc().timestamp_micros();
 

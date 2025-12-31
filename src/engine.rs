@@ -318,7 +318,7 @@ impl DeltaEngine {
         // Register each partition DIRECTORY as a table
         // DataFusion will discover and read all parquet files in each directory
         for (i, dir_path) in partition_dirs.iter().enumerate() {
-            let table_name = format!("_ts_part_{}", i);
+            let table_name = format!("_ts_part_{i}");
             ctx.register_parquet(&table_name, dir_path, Default::default())
                 .await?;
         }
@@ -327,8 +327,7 @@ impl DeltaEngine {
         let mut union_parts = Vec::new();
         for i in 0..partition_dirs.len() {
             union_parts.push(format!(
-                "SELECT * FROM _ts_part_{} WHERE {} >= '{}' AND {} < '{}'",
-                i, timestamp_col, start, timestamp_col, end
+                "SELECT * FROM _ts_part_{i} WHERE {timestamp_col} >= '{start}' AND {timestamp_col} < '{end}'"
             ));
         }
 
@@ -412,7 +411,7 @@ impl DeltaEngine {
         Ok(TableInfo {
             path: path.to_string(),
             version,
-            schema: format!("{:?}", schema),
+            schema: format!("{schema:?}"),
             num_files,
             partition_columns,
         })
@@ -556,8 +555,7 @@ impl DeltaEngine {
                 "overwrite" => SchemaMode::Overwrite,
                 _ => {
                     return Err(DeltaFusionError::InvalidConfig(format!(
-                        "Invalid schema_mode: '{}'. Use 'merge' or 'overwrite'",
-                        mode_str
+                        "Invalid schema_mode: '{mode_str}'. Use 'merge' or 'overwrite'"
                     )))
                 }
             };
@@ -664,18 +662,14 @@ fn arrow_type_to_delta(arrow_type: &arrow::datatypes::DataType) -> Result<DataTy
             DataType::Primitive(PrimitiveType::Binary)
         }
         ArrowDataType::Date32 | ArrowDataType::Date64 => DataType::Primitive(PrimitiveType::Date),
-        ArrowDataType::Timestamp(TimeUnit::Microsecond, tz) => {
-            if tz.is_some() {
-                DataType::Primitive(PrimitiveType::TimestampNtz)
-            } else {
-                DataType::Primitive(PrimitiveType::TimestampNtz)
-            }
+        ArrowDataType::Timestamp(TimeUnit::Microsecond, _) => {
+            DataType::Primitive(PrimitiveType::TimestampNtz)
         }
         ArrowDataType::Timestamp(_, _) => DataType::Primitive(PrimitiveType::TimestampNtz),
         ArrowDataType::Decimal128(precision, scale) => DataType::decimal(*precision, *scale as u8)
-            .map_err(|e| DeltaFusionError::Schema(format!("Invalid decimal: {}", e)))?,
+            .map_err(|e| DeltaFusionError::Schema(format!("Invalid decimal: {e}")))?,
         ArrowDataType::Decimal256(precision, scale) => DataType::decimal(*precision, *scale as u8)
-            .map_err(|e| DeltaFusionError::Schema(format!("Invalid decimal: {}", e)))?,
+            .map_err(|e| DeltaFusionError::Schema(format!("Invalid decimal: {e}")))?,
         // Complex types
         ArrowDataType::List(field) | ArrowDataType::LargeList(field) => {
             let element_type = arrow_type_to_delta(field.data_type())?;
@@ -704,14 +698,12 @@ fn arrow_type_to_delta(arrow_type: &arrow::datatypes::DataType) -> Result<DataTy
                 }
             }
             return Err(DeltaFusionError::Schema(format!(
-                "Unsupported map type: {:?}",
-                arrow_type
+                "Unsupported map type: {arrow_type:?}"
             )));
         }
         _ => {
             return Err(DeltaFusionError::Schema(format!(
-                "Unsupported Arrow type: {:?}",
-                arrow_type
+                "Unsupported Arrow type: {arrow_type:?}"
             )));
         }
     };
@@ -744,7 +736,7 @@ fn filter_valid_partition_dirs(partition_paths: &[String]) -> Result<Vec<String>
                     .map(|entries| {
                         entries
                             .flatten()
-                            .any(|e| e.path().extension().map_or(false, |ext| ext == "parquet"))
+                            .any(|e| e.path().extension().is_some_and(|ext| ext == "parquet"))
                     })
                     .unwrap_or(false);
 

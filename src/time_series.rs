@@ -238,8 +238,7 @@ impl Timestamp {
         }
 
         Err(DeltaFusionError::InvalidConfig(format!(
-            "Invalid ISO 8601 timestamp: '{}'. Expected format like '2024-01-15T10:30:00Z'",
-            s
+            "Invalid ISO 8601 timestamp: '{s}'. Expected format like '2024-01-15T10:30:00Z'"
         )))
     }
 
@@ -341,7 +340,7 @@ fn generate_hierarchical_partition_paths(
 
         for (col, fmt) in partition_cols.iter().zip(partition_formats.iter()) {
             let value = current_date.format(fmt).to_string();
-            path_parts.push(format!("{}={}", col, value));
+            path_parts.push(format!("{col}={value}"));
         }
 
         let full_path = path_parts.join("/");
@@ -407,7 +406,7 @@ pub fn generate_partition_glob(
 ) -> Vec<String> {
     generate_partition_paths(config, start, end)
         .into_iter()
-        .map(|p| format!("{}/*.parquet", p))
+        .map(|p| format!("{p}/*.parquet"))
         .collect()
 }
 

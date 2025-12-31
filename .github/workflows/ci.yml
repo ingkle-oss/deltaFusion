@@ -42,15 +42,16 @@ jobs:
 
       - name: Clippy
         if: matrix.check == 'clippy'
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --no-default-features -- -D warnings
 
       - name: Test
         if: matrix.check == 'test'
-        run: cargo test
+        run: cargo test --no-default-features
 
   # Python tests
   python:
     name: Python ${{ matrix.python-version }} on ${{ matrix.os }}
+    needs: rust  # Wait for all Rust checks (fmt, clippy, test) to pass
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
