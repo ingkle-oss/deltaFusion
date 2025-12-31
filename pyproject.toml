@@ -9,16 +9,41 @@ description = "High-performance Delta Lake query engine for Python"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
+authors = [
+    { name = "ysj" }
+]
+keywords = [
+    "delta-lake",
+    "datafusion",
+    "arrow",
+    "parquet",
+    "data-engineering",
+    "query-engine",
+    "polars",
+    "pyarrow",
+]
 classifiers = [
     "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Topic :: Database",
     "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: Information Analysis",
 ]
 dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/ysj/delta-fusion"
+Documentation = "https://github.com/ysj/delta-fusion/tree/main/docs"
+Repository = "https://github.com/ysj/delta-fusion"
+Issues = "https://github.com/ysj/delta-fusion/issues"
 
 [project.optional-dependencies]
 pyarrow = [
