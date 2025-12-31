@@ -663,9 +663,7 @@ fn arrow_type_to_delta(arrow_type: &arrow::datatypes::DataType) -> Result<DataTy
         ArrowDataType::Binary | ArrowDataType::LargeBinary => {
             DataType::Primitive(PrimitiveType::Binary)
         }
-        ArrowDataType::Date32 | ArrowDataType::Date64 => {
-            DataType::Primitive(PrimitiveType::Date)
-        }
+        ArrowDataType::Date32 | ArrowDataType::Date64 => DataType::Primitive(PrimitiveType::Date),
         ArrowDataType::Timestamp(TimeUnit::Microsecond, tz) => {
             if tz.is_some() {
                 DataType::Primitive(PrimitiveType::TimestampNtz)
@@ -674,16 +672,10 @@ fn arrow_type_to_delta(arrow_type: &arrow::datatypes::DataType) -> Result<DataTy
             }
         }
         ArrowDataType::Timestamp(_, _) => DataType::Primitive(PrimitiveType::TimestampNtz),
-        ArrowDataType::Decimal128(precision, scale) => {
-            DataType::decimal(*precision, *scale as u8).map_err(|e| {
-                DeltaFusionError::Schema(format!("Invalid decimal: {}", e))
-            })?
-        }
-        ArrowDataType::Decimal256(precision, scale) => {
-            DataType::decimal(*precision, *scale as u8).map_err(|e| {
-                DeltaFusionError::Schema(format!("Invalid decimal: {}", e))
-            })?
-        }
+        ArrowDataType::Decimal128(precision, scale) => DataType::decimal(*precision, *scale as u8)
+            .map_err(|e| DeltaFusionError::Schema(format!("Invalid decimal: {}", e)))?,
+        ArrowDataType::Decimal256(precision, scale) => DataType::decimal(*precision, *scale as u8)
+            .map_err(|e| DeltaFusionError::Schema(format!("Invalid decimal: {}", e)))?,
         // Complex types
         ArrowDataType::List(field) | ArrowDataType::LargeList(field) => {
             let element_type = arrow_type_to_delta(field.data_type())?;
@@ -750,11 +742,9 @@ fn filter_valid_partition_dirs(partition_paths: &[String]) -> Result<Vec<String>
                 // Check if there's at least one parquet file
                 let has_parquet = std::fs::read_dir(path)
                     .map(|entries| {
-                        entries.flatten().any(|e| {
-                            e.path()
-                                .extension()
-                                .map_or(false, |ext| ext == "parquet")
-                        })
+                        entries
+                            .flatten()
+                            .any(|e| e.path().extension().map_or(false, |ext| ext == "parquet"))
                     })
                     .unwrap_or(false);
 

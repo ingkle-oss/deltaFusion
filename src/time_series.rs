@@ -31,15 +31,15 @@ use crate::error::{DeltaFusionError, Result};
 
 /// ISO 8601 timestamp formats supported for parsing.
 const ISO8601_FORMATS: &[&str] = &[
-    "%Y-%m-%dT%H:%M:%S%.fZ",      // 2024-01-15T10:30:00.123Z
-    "%Y-%m-%dT%H:%M:%SZ",         // 2024-01-15T10:30:00Z
-    "%Y-%m-%dT%H:%M:%S%.f%:z",    // 2024-01-15T10:30:00.123+09:00
-    "%Y-%m-%dT%H:%M:%S%:z",       // 2024-01-15T10:30:00+09:00
-    "%Y-%m-%dT%H:%M:%S%.f",       // 2024-01-15T10:30:00.123
-    "%Y-%m-%dT%H:%M:%S",          // 2024-01-15T10:30:00
-    "%Y-%m-%d %H:%M:%S%.f",       // 2024-01-15 10:30:00.123 (space separator)
-    "%Y-%m-%d %H:%M:%S",          // 2024-01-15 10:30:00 (space separator)
-    "%Y-%m-%d",                   // 2024-01-15
+    "%Y-%m-%dT%H:%M:%S%.fZ",   // 2024-01-15T10:30:00.123Z
+    "%Y-%m-%dT%H:%M:%SZ",      // 2024-01-15T10:30:00Z
+    "%Y-%m-%dT%H:%M:%S%.f%:z", // 2024-01-15T10:30:00.123+09:00
+    "%Y-%m-%dT%H:%M:%S%:z",    // 2024-01-15T10:30:00+09:00
+    "%Y-%m-%dT%H:%M:%S%.f",    // 2024-01-15T10:30:00.123
+    "%Y-%m-%dT%H:%M:%S",       // 2024-01-15T10:30:00
+    "%Y-%m-%d %H:%M:%S%.f",    // 2024-01-15 10:30:00.123 (space separator)
+    "%Y-%m-%d %H:%M:%S",       // 2024-01-15 10:30:00 (space separator)
+    "%Y-%m-%d",                // 2024-01-15
 ];
 
 /// Partition granularity for hierarchical partitioning.
@@ -153,7 +153,10 @@ impl TimeSeriesConfig {
 
     /// Get the partition column name (first column for backwards compatibility).
     pub fn partition_col(&self) -> &str {
-        self.partition_cols.first().map(|s| s.as_str()).unwrap_or("")
+        self.partition_cols
+            .first()
+            .map(|s| s.as_str())
+            .unwrap_or("")
     }
 
     /// Get all partition column names.
@@ -554,10 +557,7 @@ mod tests {
         let values = generate_partition_values(&config, start, end);
         assert_eq!(
             values,
-            vec![
-                vec!["2024", "01", "15"],
-                vec!["2024", "01", "16"],
-            ]
+            vec![vec!["2024", "01", "15"], vec!["2024", "01", "16"],]
         );
     }
 

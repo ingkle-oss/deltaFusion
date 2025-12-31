@@ -148,8 +148,7 @@ fn test_generate_partition_glob() {
 
 #[test]
 fn test_generate_partition_paths_custom_format() {
-    let config =
-        TimeSeriesConfig::new("/data", "dt", "ts").with_partition_format("%Y%m%d");
+    let config = TimeSeriesConfig::new("/data", "dt", "ts").with_partition_format("%Y%m%d");
     let start = parse_timestamp("2024-01-15T10:00:00").unwrap();
     let end = parse_timestamp("2024-01-16T18:00:00").unwrap();
 

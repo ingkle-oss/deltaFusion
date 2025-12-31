@@ -62,10 +62,7 @@ pub fn create_test_parquet(
 
 /// Create a simple Delta table structure (minimal, for testing).
 /// Note: This creates a basic delta log structure without actual transactions.
-pub fn create_test_delta_table(
-    path: &Path,
-    data: Vec<(&str, Vec<i64>)>,
-) -> std::io::Result<()> {
+pub fn create_test_delta_table(path: &Path, data: Vec<(&str, Vec<i64>)>) -> std::io::Result<()> {
     fs::create_dir_all(path)?;
 
     // Create _delta_log directory
@@ -80,7 +77,10 @@ pub fn create_test_delta_table(
     let schema = Arc::new(schema);
 
     let ids: Vec<i64> = data.iter().flat_map(|(_, ids)| ids.clone()).collect();
-    let names: Vec<&str> = data.iter().flat_map(|(name, ids)| vec![*name; ids.len()]).collect();
+    let names: Vec<&str> = data
+        .iter()
+        .flat_map(|(name, ids)| vec![*name; ids.len()])
+        .collect();
 
     let id_array = Int64Array::from(ids);
     let name_array = StringArray::from(names);
@@ -93,7 +93,8 @@ pub fn create_test_delta_table(
 
     let parquet_path = path.join("part-00000.parquet");
     let file = File::create(&parquet_path)?;
-    let mut writer = ArrowWriter::try_new(file, schema.clone(), None).expect("Failed to create writer");
+    let mut writer =
+        ArrowWriter::try_new(file, schema.clone(), None).expect("Failed to create writer");
     writer.write(&batch).expect("Failed to write batch");
     writer.close().expect("Failed to close writer");
 

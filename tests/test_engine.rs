@@ -86,7 +86,9 @@ fn test_is_registered_empty() {
 #[tokio::test]
 async fn test_register_table_invalid_path() {
     let mut engine = DeltaEngine::new();
-    let result = engine.register_table("test", "/nonexistent/path/to/delta").await;
+    let result = engine
+        .register_table("test", "/nonexistent/path/to/delta")
+        .await;
     assert!(result.is_err());
 }
 

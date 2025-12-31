@@ -38,7 +38,11 @@ impl AsyncExecutor {
     /// Execute an async operation with GIL release.
     fn run<F, T>(&self, py: Python<'_>, f: F) -> PyResult<T>
     where
-        F: FnOnce(&mut DeltaEngine) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::error::Result<T>> + Send + '_>> + Send,
+        F: FnOnce(
+                &mut DeltaEngine,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::error::Result<T>> + Send + '_>,
+            > + Send,
         T: Send,
     {
         let engine = Arc::clone(&self.engine);
@@ -49,13 +53,18 @@ impl AsyncExecutor {
                 let mut engine = engine.lock().await;
                 f(&mut engine).await
             })
-        }).map_err(Into::into)
+        })
+        .map_err(Into::into)
     }
 
     /// Execute an async operation that doesn't need mutable access.
     fn run_readonly<F, T>(&self, py: Python<'_>, f: F) -> PyResult<T>
     where
-        F: FnOnce(&DeltaEngine) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::error::Result<T>> + Send + '_>> + Send,
+        F: FnOnce(
+                &DeltaEngine,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::error::Result<T>> + Send + '_>,
+            > + Send,
         T: Send,
     {
         let engine = Arc::clone(&self.engine);
@@ -66,7 +75,8 @@ impl AsyncExecutor {
                 let engine = engine.lock().await;
                 f(&engine).await
             })
-        }).map_err(Into::into)
+        })
+        .map_err(Into::into)
     }
 
     /// Execute a sync operation with GIL release.
@@ -83,7 +93,8 @@ impl AsyncExecutor {
                 let mut engine = engine.lock().await;
                 f(&mut engine)
             })
-        }).map_err(Into::into)
+        })
+        .map_err(Into::into)
     }
 }
 
@@ -114,7 +125,10 @@ fn pyarrow_to_batches(py: Python<'_>, data: &PyObject) -> PyResult<Vec<RecordBat
 
 /// Convert RecordBatches to PyArrow objects.
 fn batches_to_pyarrow(py: Python<'_>, batches: Vec<RecordBatch>) -> PyResult<Vec<PyObject>> {
-    batches.into_iter().map(|batch| batch.to_pyarrow(py)).collect()
+    batches
+        .into_iter()
+        .map(|batch| batch.to_pyarrow(py))
+        .collect()
 }
 
 /// Convert RecordBatches to Arrow IPC bytes (as Python bytes object).
@@ -128,16 +142,19 @@ fn batches_to_ipc_bytes(py: Python<'_>, batches: Vec<RecordBatch>) -> PyResult<P
 
     let schema = batches[0].schema();
     let mut buffer: Vec<u8> = Vec::new();
-    let mut writer = FileWriter::try_new(&mut buffer, &schema)
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("IPC writer error: {}", e)))?;
+    let mut writer = FileWriter::try_new(&mut buffer, &schema).map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("IPC writer error: {}", e))
+    })?;
 
     for batch in batches {
-        writer.write(&batch)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("IPC write error: {}", e)))?;
+        writer.write(&batch).map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("IPC write error: {}", e))
+        })?;
     }
 
-    writer.finish()
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("IPC finish error: {}", e)))?;
+    writer.finish().map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("IPC finish error: {}", e))
+    })?;
 
     Ok(PyBytes::new_bound(py, &buffer).unbind())
 }
@@ -237,7 +254,8 @@ impl PyDeltaEngine {
 
     /// Deregister a table.
     fn deregister_table(&self, py: Python<'_>, name: String) -> PyResult<()> {
-        self.executor.run_sync(py, |engine| engine.deregister_table(&name))
+        self.executor
+            .run_sync(py, |engine| engine.deregister_table(&name))
     }
 
     // ========================================================================
@@ -302,8 +320,14 @@ impl PyDeltaEngine {
                 &name,
                 &path,
                 &timestamp_col,
-                &partition_cols.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-                &partition_formats.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                &partition_cols
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>(),
+                &partition_formats
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>(),
             );
             Ok(())
         })
@@ -422,22 +446,26 @@ impl PyDeltaEngine {
 
     /// List all registered table names.
     fn list_tables(&self, py: Python<'_>) -> PyResult<Vec<String>> {
-        self.executor.run_sync(py, |engine| Ok(engine.list_tables()))
+        self.executor
+            .run_sync(py, |engine| Ok(engine.list_tables()))
     }
 
     /// List all registered time series names.
     fn list_time_series(&self, py: Python<'_>) -> PyResult<Vec<String>> {
-        self.executor.run_sync(py, |engine| Ok(engine.list_time_series()))
+        self.executor
+            .run_sync(py, |engine| Ok(engine.list_time_series()))
     }
 
     /// Check if a table is registered.
     fn is_registered(&self, py: Python<'_>, name: String) -> PyResult<bool> {
-        self.executor.run_sync(py, |engine| Ok(engine.is_registered(&name)))
+        self.executor
+            .run_sync(py, |engine| Ok(engine.is_registered(&name)))
     }
 
     /// Check if a time series is registered.
     fn is_time_series_registered(&self, py: Python<'_>, name: String) -> PyResult<bool> {
-        self.executor.run_sync(py, |engine| Ok(engine.is_time_series_registered(&name)))
+        self.executor
+            .run_sync(py, |engine| Ok(engine.is_time_series_registered(&name)))
     }
 
     // ========================================================================
@@ -457,7 +485,10 @@ impl PyDeltaEngine {
 
         self.executor.run_readonly(py, |engine| {
             Box::pin(async move {
-                engine.create_table(&path, &arrow_schema, partition_columns).await.map(|_| ())
+                engine
+                    .create_table(&path, &arrow_schema, partition_columns)
+                    .await
+                    .map(|_| ())
             })
         })
     }

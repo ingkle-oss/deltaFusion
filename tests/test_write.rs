@@ -204,7 +204,12 @@ async fn test_write_empty_batches() {
     let engine = DeltaEngine::new();
 
     let result = engine
-        .write(table_path.to_str().unwrap(), vec![], WriteMode::Append, None)
+        .write(
+            table_path.to_str().unwrap(),
+            vec![],
+            WriteMode::Append,
+            None,
+        )
         .await;
 
     // Should fail - no data to write
