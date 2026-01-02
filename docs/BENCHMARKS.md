@@ -1,8 +1,8 @@
 # delta_fusion Benchmark Results
 
-> Benchmark Date: 2025-01-02
+> Benchmark Date: 2026-01-02
 > Environment: macOS (Apple Silicon), Python 3.12
-> Versions: delta_fusion 0.0.1, polars 1.36.1, pyarrow 22.0.0
+> Versions: delta_fusion 1.0.2, polars 1.36.1, pyarrow 22.0.0
 
 ## Executive Summary
 
@@ -11,6 +11,8 @@
 | Small files (720 files) | 65ms | 215ms | **3.3x faster** |
 | Large dataset (1M rows) | 50ms | 56ms | **1.1x faster** |
 | Time series query (10 min) | 38ms | N/A | Partition pruning |
+| S3 COUNT(*) (1000 files) | 9ms | N/A | Metadata only |
+| S3 partition query | 2159ms | N/A | Network bound |
 
 ## Test 1: Streaming Ingestion Scenario
 
@@ -98,6 +100,67 @@ Compares full scan and filtered query performance.
 1. **Competitive Performance**: delta_fusion matches or beats polars/pyarrow
 2. **Partition Advantage**: Time series queries benefit from partition pruning
 3. **Zero-Copy Transfer**: Arrow data passes to Python without serialization
+
+## Test 4: S3 Cloud Storage Performance
+
+**Scenario**: Query Delta Lake table stored on S3-compatible storage (MinIO).
+
+Tests real-world cloud storage performance with network latency.
+
+### Environment
+
+- Storage: MinIO (S3-compatible)
+- Table: ~1000 parquet files, date-partitioned
+- Network: Local network (192.168.x.x)
+- Delta Version: 306433
+
+### Results
+
+| Query Type | Mean (ms) | Notes |
+|------------|-----------|-------|
+| SELECT * LIMIT 10 | 168 | Initial metadata fetch |
+| SELECT * LIMIT 100 | 143 | Warm cache |
+| SELECT * LIMIT 1000 | 125 | Batch efficiency |
+| SELECT * LIMIT 10000 | 262 | More data transfer |
+| COUNT(*) | 9 | Metadata-only query |
+| WHERE date='2026-01-02' | 2159 | 14,249 rows, partition filter |
+| 2 columns LIMIT 10000 | 146 | Column projection |
+
+### Key Observations
+
+1. **COUNT(*) is extremely fast** (~9ms): Uses Delta Lake metadata without scanning files
+2. **LIMIT queries are efficient**: Only fetches required rows from first matching files
+3. **Partition filtering works**: Only scans files in the requested date partition
+4. **Column projection reduces I/O**: Selecting fewer columns is faster than SELECT *
+5. **Network latency is the dominant factor**: S3 is ~2-4x slower than local storage
+
+### S3 vs Local Comparison
+
+| Operation | Local (ms) | S3 (ms) | S3 Overhead |
+|-----------|------------|---------|-------------|
+| Small query (LIMIT 10) | ~1-2 | ~168 | Network RTT |
+| Large query (10K rows) | ~65 | ~262 | ~4x slower |
+| COUNT(*) | N/A | ~9 | Metadata only |
+
+### S3 Configuration
+
+```python
+from delta_fusion import DeltaEngine
+
+engine = DeltaEngine(
+    endpoint_url='http://your-minio:9000',
+    access_key='your-access-key',
+    secret_key='your-secret-key',
+    region='us-east-1',
+    allow_http=True  # For non-SSL endpoints
+)
+
+# Query S3-based Delta table
+result = engine.query(
+    "s3://bucket/path/to/delta",
+    "SELECT * FROM delta WHERE date = '2026-01-02'"
+)
+```
 
 ## Architecture: Why It's Fast
 
