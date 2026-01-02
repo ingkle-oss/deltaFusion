@@ -40,15 +40,25 @@ class DeltaEngine:
             - aws_region: AWS region
             - aws_endpoint: Custom S3 endpoint (for MinIO, etc.)
             - aws_allow_http: Allow non-SSL connections
+        target_partitions: Number of partitions for parallel execution.
+            - None (default): Use all CPU cores
+            - 1: Single-threaded, lowest CPU usage
+            - 2-4: Balanced CPU usage
+            - Higher: More parallelism, higher CPU usage
 
     Example:
         >>> engine = DeltaEngine()
         >>> engine.register_table("sales", "s3://bucket/sales_delta")
         >>> results = engine.query("SELECT * FROM sales WHERE year = 2024")
+
+        # Low CPU usage mode
+        >>> engine = DeltaEngine(target_partitions=2)
     """
 
-    def __init__(self, storage_options: dict | None = None):
-        self._engine = _CoreEngine(storage_options)
+    def __init__(
+        self, storage_options: dict | None = None, target_partitions: int | None = None
+    ):
+        self._engine = _CoreEngine(storage_options, target_partitions)
 
     # ========================================================================
     # Delta Table Methods

@@ -40,6 +40,55 @@ struct CachedTable {
     loaded_version: Option<i64>,
 }
 
+/// Engine configuration options.
+#[derive(Debug, Clone)]
+pub struct EngineConfig {
+    /// Number of partitions for parallel query execution.
+    /// Lower values reduce CPU usage but may slow down large queries.
+    /// Default: number of CPU cores
+    pub target_partitions: usize,
+    /// Batch size for query execution.
+    /// Default: 8192
+    pub batch_size: usize,
+}
+
+impl Default for EngineConfig {
+    fn default() -> Self {
+        Self {
+            target_partitions: num_cpus::get(),
+            batch_size: 8192,
+        }
+    }
+}
+
+impl EngineConfig {
+    /// Create config optimized for low CPU usage.
+    /// Uses fewer partitions (max 4) to reduce parallelism overhead.
+    pub fn low_cpu() -> Self {
+        Self {
+            target_partitions: num_cpus::get().min(4),
+            batch_size: 8192,
+        }
+    }
+
+    /// Create config optimized for small datasets.
+    /// Uses single partition to minimize overhead.
+    pub fn single_threaded() -> Self {
+        Self {
+            target_partitions: 1,
+            batch_size: 8192,
+        }
+    }
+
+    /// Create config with custom partition count.
+    pub fn with_partitions(partitions: usize) -> Self {
+        Self {
+            target_partitions: partitions.max(1),
+            batch_size: 8192,
+        }
+    }
+}
+
 /// DeltaEngine provides SQL query capabilities over Delta Lake tables.
 ///
 /// Uses DataFusion as the query engine with zero-copy Arrow data transfer.
@@ -47,6 +96,7 @@ struct CachedTable {
 pub struct DeltaEngine {
     ctx: SessionContext,
     storage_config: StorageConfig,
+    engine_config: EngineConfig,
     /// Cached Delta tables: name -> CachedTable
     tables: HashMap<String, CachedTable>,
     /// Time series configurations: name -> TimeSeriesConfig
@@ -56,22 +106,33 @@ pub struct DeltaEngine {
 impl DeltaEngine {
     /// Create a new DeltaEngine instance.
     pub fn new() -> Self {
-        Self::with_config(StorageConfig::from_env())
+        Self::with_configs(StorageConfig::from_env(), EngineConfig::default())
     }
 
     /// Create a new DeltaEngine with custom storage configuration.
     pub fn with_config(storage_config: StorageConfig) -> Self {
+        Self::with_configs(storage_config, EngineConfig::default())
+    }
+
+    /// Create a new DeltaEngine with custom storage and engine configuration.
+    pub fn with_configs(storage_config: StorageConfig, engine_config: EngineConfig) -> Self {
         let config = SessionConfig::new()
-            .with_target_partitions(num_cpus::get())
-            .with_batch_size(8192);
+            .with_target_partitions(engine_config.target_partitions)
+            .with_batch_size(engine_config.batch_size);
         let ctx = SessionContext::new_with_config(config);
 
         Self {
             ctx,
             storage_config,
+            engine_config,
             tables: HashMap::new(),
             time_series: HashMap::new(),
         }
+    }
+
+    /// Get current engine configuration.
+    pub fn engine_config(&self) -> &EngineConfig {
+        &self.engine_config
     }
 
     // ========================================================================
@@ -341,8 +402,8 @@ impl DeltaEngine {
     /// Create a new session context with storage options.
     async fn create_session_with_storage(&self) -> Result<SessionContext> {
         let config = SessionConfig::new()
-            .with_target_partitions(num_cpus::get())
-            .with_batch_size(8192);
+            .with_target_partitions(self.engine_config.target_partitions)
+            .with_batch_size(self.engine_config.batch_size);
 
         let ctx = SessionContext::new_with_config(config);
 

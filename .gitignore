@@ -15,16 +15,38 @@ dist/
 *.egg
 .venv/
 venv/
+env/
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 # IDE
 .idea/
 .vscode/
 *.swp
 *.swo
+*~
+.DS_Store
 
 # maturin
 *.whl
 
-# claude
+# Benchmarks
+benchmarks/data/
+
+# Logs
+*.log
+logs/
+
+# Testing
+.coverage
+htmlcov/
+.tox/
+
+# Environment
+.env
+.env.local
+*.env
+
+# Claude
 /.claude

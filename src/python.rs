@@ -22,7 +22,7 @@ use std::sync::Arc;
 use tokio::runtime::Runtime;
 
 use crate::config::{init_logging, StorageConfig};
-use crate::engine::{DeltaEngine, WriteMode};
+use crate::engine::{DeltaEngine, EngineConfig, WriteMode};
 use crate::error::DeltaFusionError;
 
 // =============================================================================
@@ -194,18 +194,35 @@ pub struct PyDeltaEngine {
 #[pymethods]
 impl PyDeltaEngine {
     /// Create a new DeltaEngine.
+    ///
+    /// Args:
+    ///     storage_options: Optional dict with S3/storage configuration
+    ///     target_partitions: Number of partitions for parallel execution.
+    ///         - None (default): Use all CPU cores
+    ///         - 1: Single-threaded, lowest CPU usage
+    ///         - 2-4: Balanced CPU usage
+    ///         - Higher: More parallelism, higher CPU usage
     #[new]
-    #[pyo3(signature = (storage_options=None))]
-    fn new(storage_options: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
+    #[pyo3(signature = (storage_options=None, target_partitions=None))]
+    fn new(
+        storage_options: Option<&Bound<'_, PyDict>>,
+        target_partitions: Option<usize>,
+    ) -> PyResult<Self> {
         init_logging();
 
         let storage_config = parse_storage_options(storage_options)?;
+
+        let engine_config = match target_partitions {
+            Some(1) => EngineConfig::single_threaded(),
+            Some(n) => EngineConfig::with_partitions(n),
+            None => EngineConfig::default(),
+        };
 
         let runtime = Runtime::new().map_err(|e| {
             DeltaFusionError::Runtime(format!("Failed to create Tokio runtime: {e}"))
         })?;
 
-        let engine = DeltaEngine::with_config(storage_config);
+        let engine = DeltaEngine::with_configs(storage_config, engine_config);
 
         Ok(Self {
             executor: AsyncExecutor::new(

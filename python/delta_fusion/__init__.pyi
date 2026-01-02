@@ -5,7 +5,23 @@ from typing import Any
 class DeltaEngine:
     """High-performance Delta Lake query engine."""
 
-    def __init__(self, storage_options: dict[str, Any] | None = None) -> None: ...
+    def __init__(
+        self,
+        storage_options: dict[str, Any] | None = None,
+        target_partitions: int | None = None,
+    ) -> None:
+        """
+        Create a new DeltaEngine.
+
+        Args:
+            storage_options: Optional dict with S3/storage configuration
+            target_partitions: Number of partitions for parallel execution.
+                - None (default): Use all CPU cores
+                - 1: Single-threaded, lowest CPU usage
+                - 2-4: Balanced CPU usage
+                - Higher: More parallelism, higher CPU usage
+        """
+        ...
 
     # Delta Table Methods
     def register_table(
