@@ -13,7 +13,7 @@ python = ["pyo3"]
 
 [dependencies]
 # Delta Lake
-deltalake = { version = "0.22", features = ["datafusion"] }
+deltalake = { version = "0.22", features = ["datafusion", "s3"] }
 
 # Arrow & DataFusion
 arrow = { version = "53", features = ["pyarrow", "ipc"] }
