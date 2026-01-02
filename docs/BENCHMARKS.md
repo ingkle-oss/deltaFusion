@@ -162,6 +162,46 @@ result = engine.query(
 )
 ```
 
+## Test 5: SQL API vs Time Series API on S3
+
+**Scenario**: Compare SQL API (Delta table) vs Time Series API performance on S3.
+
+### Results
+
+| Time Range | SQL API | Time Series API | Winner |
+|------------|---------|-----------------|--------|
+| 10 min | 590 ms | 7,323 ms | SQL 12x faster |
+| 1 hour | 2,353 ms | 3,106 ms | SQL 1.3x faster |
+
+### Why SQL API is Faster on S3
+
+1. **Delta Lake metadata caching**: Avoids repeated log replay
+2. **Single table registration**: No per-partition listing overhead
+3. **Optimized query planning**: DataFusion optimizes across all files
+4. **No UNION ALL overhead**: Queries all partitions in one pass
+
+### Time Series API Overhead on S3
+
+```
+Time Series API on S3:
+┌─────────────────────────────────────────────────────────────────┐
+│ 1. Generate partition paths (date=2024-01-15, date=2024-01-16)  │
+│ 2. For each partition:                                          │
+│    - Register S3 object store                                   │
+│    - List files in directory (S3 API call)                      │
+│    - Register as listing table                                  │
+│ 3. Execute UNION ALL query across all partitions                │
+│ 4. Cleanup temporary tables                                     │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Recommendation
+
+| Storage | Recommended API | Reason |
+|---------|-----------------|--------|
+| **Local files** | Time Series API | Direct parquet reading, no overhead |
+| **S3/Cloud** | SQL API (Delta) | Metadata caching, optimized queries |
+
 ## Architecture: Why It's Fast
 
 ### 1. Direct Parquet Reading (for local files)
