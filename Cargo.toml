@@ -8,12 +8,13 @@ name = "delta_fusion"
 crate-type = ["cdylib", "rlib"]
 
 [features]
-default = ["python"]
+default = ["python", "s3"]
 python = ["pyo3"]
+s3 = ["deltalake/s3"]
 
 [dependencies]
 # Delta Lake
-deltalake = { version = "0.22", features = ["datafusion", "s3"] }
+deltalake = { version = "0.22", features = ["datafusion"] }
 
 # Arrow & DataFusion
 arrow = { version = "53", features = ["pyarrow", "ipc"] }

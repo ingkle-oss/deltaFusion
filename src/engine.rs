@@ -2,7 +2,18 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Once};
+
+/// Register cloud storage handlers (S3, etc.) once.
+static REGISTER_HANDLERS: Once = Once::new();
+
+fn register_cloud_handlers() {
+    REGISTER_HANDLERS.call_once(|| {
+        // Register S3 handler
+        #[cfg(feature = "s3")]
+        deltalake::aws::register_handlers(None);
+    });
+}
 
 use arrow::datatypes::Schema as ArrowSchema;
 use arrow::record_batch::RecordBatch;
@@ -116,6 +127,9 @@ impl DeltaEngine {
 
     /// Create a new DeltaEngine with custom storage and engine configuration.
     pub fn with_configs(storage_config: StorageConfig, engine_config: EngineConfig) -> Self {
+        // Register cloud storage handlers (S3, Azure, GCS, etc.)
+        register_cloud_handlers();
+
         let config = SessionConfig::new()
             .with_target_partitions(engine_config.target_partitions)
             .with_batch_size(engine_config.batch_size);
