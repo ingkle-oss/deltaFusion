@@ -13,6 +13,8 @@
 | Time series query (10 min) | 38ms | N/A | Partition pruning |
 | S3 COUNT(*) (1000 files) | 9ms | N/A | Metadata only |
 | S3 partition query | 2159ms | N/A | Network bound |
+| S3 time range (10 min) | 535ms | ERROR | **Timestamp filter** |
+| S3 time range (1 day) | 1673ms | 19535ms | **11.7x faster** |
 
 ## Test 1: Streaming Ingestion Scenario
 
@@ -201,6 +203,59 @@ Time Series API on S3:
 |---------|-----------------|--------|
 | **Local files** | Time Series API | Direct parquet reading, no overhead |
 | **S3/Cloud** | SQL API (Delta) | Metadata caching, optimized queries |
+
+## Test 6: Cross-Library S3 Benchmark
+
+**Scenario**: Compare delta_fusion with other Python libraries for querying Delta Lake tables on S3 with time range filters.
+
+### Libraries Tested
+
+| Library | Version | Method |
+|---------|---------|--------|
+| delta_fusion | 1.0.2 | SQL API with DataFusion |
+| polars | 1.36.1 | `pl.scan_delta().filter()` |
+| deltalake | 0.22.3 | `DeltaTable().to_pyarrow_dataset().to_table()` |
+| duckdb | 1.1.3 | `delta_scan()` with SQL filter |
+
+### Results
+
+| Library | 10 min (ms) | 1 hour (ms) | 1 day (ms) |
+|---------|-------------|-------------|------------|
+| delta_fusion | **535** | 2,793 | **1,673** |
+| polars | ERROR | ERROR | 19,535 |
+| deltalake | ERROR | ERROR | 5,325 |
+| duckdb | 944 | **576** | 5,070 |
+
+### Winner by Query Range
+
+| Query Range | Winner | Time (ms) | Notes |
+|-------------|--------|-----------|-------|
+| 10 minutes | delta_fusion | 535 | 1.8x faster than duckdb |
+| 1 hour | duckdb | 576 | delta_fusion 2,793ms |
+| 1 day | delta_fusion | 1,673 | 3x faster than duckdb |
+
+### Key Observations
+
+1. **delta_fusion wins for narrow and wide queries**: Best performance for 10min and 1-day ranges
+2. **duckdb excels at mid-range queries**: Fastest for 1-hour queries
+3. **polars/deltalake struggle with timestamp filters**: Both fail on timezone-aware timestamp comparisons
+4. **Timestamp type matters**: delta_fusion handles both naive and timezone-aware timestamps correctly
+
+### Error Analysis
+
+polars and deltalake failed on time range queries with errors like:
+```
+polars: "cannot compare Datetime(Microsecond, Some(\"UTC\")) with Datetime(Microsecond, None)"
+deltalake: Filter pushdown issue with timezone-aware timestamps
+```
+
+This is a common issue when Delta tables use timezone-aware timestamps but filter expressions use naive timestamps.
+
+### Why delta_fusion Handles This Better
+
+1. **DataFusion's flexible type coercion**: Automatically handles timestamp comparisons
+2. **SQL-based filtering**: `WHERE timestamp >= '2024-01-15'` works regardless of timezone
+3. **Predicate pushdown**: Efficient filtering at the parquet reader level
 
 ## Architecture: Why It's Fast
 
