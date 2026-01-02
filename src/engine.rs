@@ -503,8 +503,8 @@ impl DeltaEngine {
         start: &str,
         end: &str,
     ) -> Result<Vec<RecordBatch>> {
-        use datafusion::datasource::listing::ListingOptions;
         use datafusion::datasource::file_format::parquet::ParquetFormat;
+        use datafusion::datasource::listing::ListingOptions;
         use std::time::{SystemTime, UNIX_EPOCH};
 
         // Generate unique prefix for this query to avoid table name conflicts
@@ -515,8 +515,7 @@ impl DeltaEngine {
 
         // Register each partition DIRECTORY as a table using listing options
         let file_format = Arc::new(ParquetFormat::default());
-        let listing_options = ListingOptions::new(file_format)
-            .with_file_extension(".parquet");
+        let listing_options = ListingOptions::new(file_format).with_file_extension(".parquet");
 
         let mut table_names = Vec::new();
         for (i, dir_path) in partition_dirs.iter().enumerate() {
