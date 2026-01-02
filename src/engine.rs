@@ -9,10 +9,66 @@ static REGISTER_HANDLERS: Once = Once::new();
 
 fn register_cloud_handlers() {
     REGISTER_HANDLERS.call_once(|| {
-        // Register S3 handler
+        // Register S3 handler for delta-rs
         #[cfg(feature = "s3")]
         deltalake::aws::register_handlers(None);
     });
+}
+
+/// Register S3 object store for a specific bucket with DataFusion SessionContext.
+#[cfg(feature = "s3")]
+fn register_s3_object_store_for_bucket(
+    ctx: &SessionContext,
+    config: &crate::config::StorageConfig,
+    bucket: &str,
+) -> Result<()> {
+    use object_store::aws::AmazonS3Builder;
+    use url::Url;
+
+    // Only register if we have S3 configuration
+    if !config.has_s3_credentials() {
+        return Ok(());
+    }
+
+    let mut builder = AmazonS3Builder::new().with_bucket_name(bucket);
+
+    if let Some(key) = config.aws_access_key_id() {
+        builder = builder.with_access_key_id(key);
+    }
+    if let Some(secret) = config.aws_secret_access_key() {
+        builder = builder.with_secret_access_key(secret);
+    }
+    if let Some(region) = config.aws_region() {
+        builder = builder.with_region(region);
+    }
+    if let Some(endpoint) = config.aws_endpoint() {
+        builder = builder.with_endpoint(endpoint);
+    }
+    if config.aws_allow_http() {
+        builder = builder.with_allow_http(true);
+    }
+
+    // Build the S3 store with virtual-hosted-style disabled for MinIO compatibility
+    let store = builder
+        .with_virtual_hosted_style_request(false)
+        .build()
+        .map_err(|e| DeltaFusionError::InvalidConfig(format!("Failed to build S3 store: {e}")))?;
+
+    // Register with DataFusion's runtime using the bucket URL
+    let url = Url::parse(&format!("s3://{bucket}")).unwrap();
+    ctx.register_object_store(&url, Arc::new(store));
+
+    Ok(())
+}
+
+/// Extract bucket name from S3 URL.
+#[cfg(feature = "s3")]
+fn extract_s3_bucket(path: &str) -> Option<&str> {
+    if path.starts_with("s3://") {
+        path.strip_prefix("s3://")?.split('/').next()
+    } else {
+        None
+    }
 }
 
 use arrow::datatypes::Schema as ArrowSchema;
@@ -331,13 +387,14 @@ impl DeltaEngine {
             return Ok(vec![]);
         }
 
-        // Create a temporary session for this query
-        let ctx = self.create_session_with_storage().await?;
+        // Register S3 object store if this is an S3 path
+        #[cfg(feature = "s3")]
+        if let Some(bucket) = extract_s3_bucket(config.path()) {
+            register_s3_object_store_for_bucket(&self.ctx, &self.storage_config, bucket)?;
+        }
 
-        // Register partition DIRECTORIES (not individual files)
-        // DataFusion handles multiple files within each directory efficiently
         let timestamp_col = config.timestamp_col();
-        self.read_parquet_files_with_filter(&ctx, &valid_partitions, timestamp_col, start, end)
+        self.read_parquet_files_with_filter(&self.ctx, &valid_partitions, timestamp_col, start, end)
             .await
     }
 
@@ -368,9 +425,13 @@ impl DeltaEngine {
             return Ok(vec![]);
         }
 
-        let ctx = self.create_session_with_storage().await?;
+        // Register S3 object store if this is an S3 path
+        #[cfg(feature = "s3")]
+        if let Some(bucket) = extract_s3_bucket(path) {
+            register_s3_object_store_for_bucket(&self.ctx, &self.storage_config, bucket)?;
+        }
 
-        self.read_parquet_files_with_filter(&ctx, &valid_partitions, timestamp_col, start, end)
+        self.read_parquet_files_with_filter(&self.ctx, &valid_partitions, timestamp_col, start, end)
             .await
     }
 
@@ -442,24 +503,51 @@ impl DeltaEngine {
         start: &str,
         end: &str,
     ) -> Result<Vec<RecordBatch>> {
-        // Register each partition DIRECTORY as a table
+        use datafusion::datasource::listing::ListingOptions;
+        use datafusion::datasource::file_format::parquet::ParquetFormat;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        // Generate unique prefix for this query to avoid table name conflicts
+        let query_id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        // Register each partition DIRECTORY as a table using listing options
+        let file_format = Arc::new(ParquetFormat::default());
+        let listing_options = ListingOptions::new(file_format)
+            .with_file_extension(".parquet");
+
+        let mut table_names = Vec::new();
         for (i, dir_path) in partition_dirs.iter().enumerate() {
-            let table_name = format!("_ts_part_{i}");
-            ctx.register_parquet(&table_name, dir_path, Default::default())
+            let table_name = format!("_ts_{query_id}_{i}");
+            table_names.push(table_name.clone());
+            // Ensure path ends with / for directory listing
+            let dir_url = if dir_path.ends_with('/') {
+                dir_path.clone()
+            } else {
+                format!("{dir_path}/")
+            };
+            ctx.register_listing_table(&table_name, &dir_url, listing_options.clone(), None, None)
                 .await?;
         }
 
         // Build UNION ALL query
         let mut union_parts = Vec::new();
-        for i in 0..partition_dirs.len() {
+        for table_name in &table_names {
             union_parts.push(format!(
-                "SELECT * FROM _ts_part_{i} WHERE {timestamp_col} >= '{start}' AND {timestamp_col} < '{end}'"
+                "SELECT * FROM {table_name} WHERE {timestamp_col} >= '{start}' AND {timestamp_col} < '{end}'"
             ));
         }
 
         let sql = union_parts.join(" UNION ALL ");
         let df = ctx.sql(&sql).await?;
         let batches = df.collect().await?;
+
+        // Cleanup: deregister temporary tables
+        for table_name in &table_names {
+            let _ = ctx.deregister_table(table_name.as_str());
+        }
 
         Ok(batches)
     }
@@ -531,25 +619,6 @@ impl DeltaEngine {
         }
 
         Ok(all_batches)
-    }
-
-    /// Create a new session context with storage options.
-    async fn create_session_with_storage(&self) -> Result<SessionContext> {
-        let config = SessionConfig::new()
-            .with_target_partitions(self.engine_config.target_partitions)
-            .with_batch_size(self.engine_config.batch_size);
-
-        let ctx = SessionContext::new_with_config(config);
-
-        // Register object store if needed
-        let storage_opts = self.storage_config.to_storage_options();
-        if !storage_opts.is_empty() {
-            // For S3, we need to configure the runtime
-            // This is handled by DataFusion's built-in S3 support
-            // when we use s3:// URLs
-        }
-
-        Ok(ctx)
     }
 
     // ========================================================================

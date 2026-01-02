@@ -10,7 +10,7 @@ crate-type = ["cdylib", "rlib"]
 [features]
 default = ["python", "s3"]
 python = ["pyo3"]
-s3 = ["deltalake/s3"]
+s3 = ["deltalake/s3", "object_store/aws"]
 
 [dependencies]
 # Delta Lake
@@ -22,6 +22,7 @@ arrow-ipc = "53"
 arrow-ord = "53"
 parquet = { version = "53", features = ["arrow"] }
 datafusion = "43"
+object_store = "0.11"
 
 # PyO3 bindings
 pyo3 = { version = "0.22", features = ["extension-module"], optional = true }
@@ -42,6 +43,7 @@ chrono = "0.4"
 
 # Utils
 num_cpus = "1.16"
+url = "2.5"
 
 # Logging
 log = "0.4"
