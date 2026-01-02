@@ -127,6 +127,45 @@ def create_parquet_partitioned(path: Path, num_rows: int):
     print(f"  Created partitioned parquet at {path} with {num_rows:,} rows")
 
 
+def create_many_small_files(path: Path, num_rows: int, files_per_partition: int = 10):
+    """Create partitioned data with many small parquet files per partition.
+
+    This simulates real-world scenarios where data is written frequently
+    in small batches, resulting in many small files.
+    """
+    if path.exists():
+        shutil.rmtree(path)
+    path.mkdir(parents=True)
+
+    table = generate_test_data(num_rows)
+    df = table.to_pandas()
+
+    total_files = 0
+    # Write partitioned by date with multiple small files per partition
+    for date, group in df.groupby("date"):
+        partition_dir = path / f"date={date}"
+        partition_dir.mkdir(exist_ok=True)
+
+        # Split each partition into multiple small files
+        rows_per_file = max(1, len(group) // files_per_partition)
+        for i in range(files_per_partition):
+            start_idx = i * rows_per_file
+            end_idx = start_idx + rows_per_file if i < files_per_partition - 1 else len(group)
+
+            if start_idx >= len(group):
+                break
+
+            chunk = group.iloc[start_idx:end_idx]
+            if len(chunk) == 0:
+                continue
+
+            partition_table = pa.Table.from_pandas(chunk.drop(columns=["date"]))
+            pq.write_table(partition_table, partition_dir / f"data_{i:03d}.parquet")
+            total_files += 1
+
+    print(f"  Created {total_files} small parquet files at {path} with {num_rows:,} rows")
+
+
 # =============================================================================
 # Benchmark Utilities
 # =============================================================================
@@ -436,6 +475,62 @@ def benchmark_time_series(parquet_path: Path, delta_path: Path, num_rows: int) -
     return results
 
 
+def benchmark_many_small_files(small_files_path: Path, num_rows: int) -> list[dict]:
+    """Benchmark reading many small parquet files per partition.
+
+    This tests the overhead of opening/reading many small files,
+    which is a common performance issue in data lakes.
+    """
+    results = []
+
+    # Date range for query (first 3 days)
+    start_date = "2024-01-01"
+    end_date = "2024-01-04"
+
+    # delta_fusion time series API
+    if HAVE_DELTA_FUSION:
+        engine = delta_fusion.DeltaEngine()
+        engine.register_time_series(
+            "small_files",
+            str(small_files_path),
+            timestamp_col="timestamp",
+            partition_col="date",
+        )
+
+        def df_query():
+            return engine.read_time_range("small_files", start_date, end_date)
+
+        results.append(run_benchmark("delta_fusion (time_series)", df_query))
+
+    # polars reading parquet directory
+    if HAVE_POLARS:
+        def pl_query():
+            # Read all parquet files from matching partitions
+            dfs = []
+            for date_dir in small_files_path.glob("date=2024-01-0[123]"):
+                for pq_file in date_dir.glob("*.parquet"):
+                    dfs.append(pl.read_parquet(pq_file))
+            if dfs:
+                return pl.concat(dfs)
+            return pl.DataFrame()
+
+        results.append(run_benchmark("polars (glob)", pl_query))
+
+    # pyarrow.parquet reading
+    def pa_query():
+        tables = []
+        for date_dir in small_files_path.glob("date=2024-01-0[123]"):
+            for pq_file in date_dir.glob("*.parquet"):
+                tables.append(pq.read_table(pq_file))
+        if tables:
+            return pa.concat_tables(tables)
+        return pa.table({})
+
+    results.append(run_benchmark("pyarrow (glob)", pa_query))
+
+    return results
+
+
 # =============================================================================
 # Main
 # =============================================================================
@@ -464,10 +559,12 @@ def main():
         # Create test data
         delta_path = BENCHMARK_DIR / f"delta_{num_rows}"
         parquet_path = BENCHMARK_DIR / f"parquet_{num_rows}"
+        small_files_path = BENCHMARK_DIR / f"small_files_{num_rows}"
 
         print("\nGenerating test data...")
         create_delta_table(delta_path, num_rows)
         create_parquet_partitioned(parquet_path, num_rows)
+        create_many_small_files(small_files_path, num_rows, files_per_partition=10)
 
         # Run benchmarks
         print("\nRunning benchmarks...")
@@ -487,6 +584,10 @@ def main():
         # 4. Time series
         results = benchmark_time_series(parquet_path, delta_path, num_rows)
         print_results(results, f"Time Series Query ({num_rows:,} rows, 3 days)")
+
+        # 5. Many small files
+        results = benchmark_many_small_files(small_files_path, num_rows)
+        print_results(results, f"Many Small Files ({num_rows:,} rows, 10 files/partition)")
 
     # Cleanup option
     print("\nBenchmark complete!")
