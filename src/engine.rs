@@ -362,8 +362,7 @@ impl DeltaEngine {
 
     /// Read parquet files with timestamp filter.
     ///
-    /// Registers partition DIRECTORIES (not individual files) as tables.
-    /// DataFusion handles multiple files within each directory efficiently.
+    /// Uses direct parquet reading for better performance with many small files.
     async fn read_parquet_files_with_filter(
         &self,
         ctx: &SessionContext,
@@ -376,15 +375,64 @@ impl DeltaEngine {
             return Ok(vec![]);
         }
 
+        // Collect all parquet files from partition directories
+        let mut all_files: Vec<String> = Vec::new();
+        for dir_path in partition_dirs {
+            if dir_path.starts_with("s3://")
+                || dir_path.starts_with("gs://")
+                || dir_path.starts_with("az://")
+            {
+                // Cloud storage - use register_parquet for directory
+                all_files.push(dir_path.clone());
+            } else {
+                // Local filesystem - collect individual files
+                let path = std::path::Path::new(dir_path);
+                if path.is_dir() {
+                    if let Ok(entries) = std::fs::read_dir(path) {
+                        for entry in entries.flatten() {
+                            let file_path = entry.path();
+                            if file_path.extension().is_some_and(|ext| ext == "parquet") {
+                                all_files.push(file_path.to_string_lossy().to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if all_files.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // For cloud storage or when we have directories, use the old method
+        if all_files.iter().any(|f| f.starts_with("s3://") || f.ends_with("/")) {
+            return self
+                .read_parquet_via_sql(ctx, partition_dirs, timestamp_col, start, end)
+                .await;
+        }
+
+        // Direct parquet reading for local files - much faster for many small files
+        self.read_parquet_direct(&all_files, timestamp_col, start, end)
+            .await
+    }
+
+    /// Read parquet files via DataFusion SQL (for cloud storage).
+    async fn read_parquet_via_sql(
+        &self,
+        ctx: &SessionContext,
+        partition_dirs: &[String],
+        timestamp_col: &str,
+        start: &str,
+        end: &str,
+    ) -> Result<Vec<RecordBatch>> {
         // Register each partition DIRECTORY as a table
-        // DataFusion will discover and read all parquet files in each directory
         for (i, dir_path) in partition_dirs.iter().enumerate() {
             let table_name = format!("_ts_part_{i}");
             ctx.register_parquet(&table_name, dir_path, Default::default())
                 .await?;
         }
 
-        // Build UNION ALL query - now only N partitions (days), not N files
+        // Build UNION ALL query
         let mut union_parts = Vec::new();
         for i in 0..partition_dirs.len() {
             union_parts.push(format!(
@@ -397,6 +445,76 @@ impl DeltaEngine {
         let batches = df.collect().await?;
 
         Ok(batches)
+    }
+
+    /// Read parquet files directly using Arrow (fast path for local files).
+    async fn read_parquet_direct(
+        &self,
+        files: &[String],
+        timestamp_col: &str,
+        start: &str,
+        end: &str,
+    ) -> Result<Vec<RecordBatch>> {
+        use arrow::array::{Array, Scalar, TimestampMicrosecondArray};
+        use arrow::compute::{and, filter_record_batch};
+        use arrow::datatypes::DataType;
+        use arrow_ord::cmp::{gt_eq, lt};
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use std::fs::File;
+
+        let start_ts = parse_timestamp(start)?;
+        let end_ts = parse_timestamp(end)?;
+        let start_micros = start_ts.and_utc().timestamp_micros();
+        let end_micros = end_ts.and_utc().timestamp_micros();
+
+        // Create scalar values for comparison
+        let start_scalar = Scalar::new(TimestampMicrosecondArray::from(vec![start_micros]));
+        let end_scalar = Scalar::new(TimestampMicrosecondArray::from(vec![end_micros]));
+
+        let mut all_batches = Vec::new();
+
+        for file_path in files {
+            let file = File::open(file_path)?;
+            let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+            let reader = builder.build()?;
+
+            for batch_result in reader {
+                let batch = batch_result?;
+
+                // Find timestamp column and filter
+                if let Ok(col_idx) = batch.schema().index_of(timestamp_col) {
+                    let ts_col = batch.column(col_idx);
+
+                    // Create filter mask based on timestamp type
+                    let mask = match ts_col.data_type() {
+                        DataType::Timestamp(_, _) => {
+                            let ts_array = ts_col
+                                .as_any()
+                                .downcast_ref::<TimestampMicrosecondArray>();
+                            if let Some(arr) = ts_array {
+                                let ge_start = gt_eq(arr, &start_scalar)?;
+                                let lt_end = lt(arr, &end_scalar)?;
+                                and(&ge_start, &lt_end)?
+                            } else {
+                                continue;
+                            }
+                        }
+                        _ => continue,
+                    };
+
+                    // Apply filter
+                    let filtered = filter_record_batch(&batch, &mask)?;
+                    if filtered.num_rows() > 0 {
+                        all_batches.push(filtered);
+                    }
+                } else {
+                    // No timestamp column, include all rows
+                    all_batches.push(batch);
+                }
+            }
+        }
+
+        Ok(all_batches)
     }
 
     /// Create a new session context with storage options.

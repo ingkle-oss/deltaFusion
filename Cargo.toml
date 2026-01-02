@@ -18,6 +18,8 @@ deltalake = { version = "0.22", features = ["datafusion"] }
 # Arrow & DataFusion
 arrow = { version = "53", features = ["pyarrow", "ipc"] }
 arrow-ipc = "53"
+arrow-ord = "53"
+parquet = { version = "53", features = ["arrow"] }
 datafusion = "43"
 
 # PyO3 bindings

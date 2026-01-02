@@ -54,6 +54,9 @@ pub enum DeltaFusionError {
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
+    #[error("Parquet error: {0}")]
+    Parquet(#[from] parquet::errors::ParquetError),
+
     #[error("Table not found: {0}")]
     TableNotFound(String),
 
@@ -92,6 +95,7 @@ impl DeltaFusionError {
             DeltaFusionError::DataFusion(_) => ErrorKind::Query,
             DeltaFusionError::Io(_) => ErrorKind::Storage,
             DeltaFusionError::Json(_) => ErrorKind::Schema,
+            DeltaFusionError::Parquet(_) => ErrorKind::Storage,
             DeltaFusionError::TableNotFound(_) => ErrorKind::NotFound,
             DeltaFusionError::InvalidConfig(_) => ErrorKind::Config,
             DeltaFusionError::Query(_) => ErrorKind::Query,
