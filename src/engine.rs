@@ -405,7 +405,10 @@ impl DeltaEngine {
         }
 
         // For cloud storage or when we have directories, use the old method
-        if all_files.iter().any(|f| f.starts_with("s3://") || f.ends_with("/")) {
+        if all_files
+            .iter()
+            .any(|f| f.starts_with("s3://") || f.ends_with("/"))
+        {
             return self
                 .read_parquet_via_sql(ctx, partition_dirs, timestamp_col, start, end)
                 .await;
@@ -488,9 +491,8 @@ impl DeltaEngine {
                     // Create filter mask based on timestamp type
                     let mask = match ts_col.data_type() {
                         DataType::Timestamp(_, _) => {
-                            let ts_array = ts_col
-                                .as_any()
-                                .downcast_ref::<TimestampMicrosecondArray>();
+                            let ts_array =
+                                ts_col.as_any().downcast_ref::<TimestampMicrosecondArray>();
                             if let Some(arr) = ts_array {
                                 let ge_start = gt_eq(arr, &start_scalar)?;
                                 let lt_end = lt(arr, &end_scalar)?;
